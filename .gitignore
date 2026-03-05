@@ -1,0 +1,99 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual Environments ──────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+.env/
+Scripts/
+Lib/
+
+# ── Secrets / Credentials ─────────────────────────────────────
+# NEVER commit these — use config/settings.local.py instead
+config/settings.py
+.env
+*.env
+secrets.py
+
+# ── Diagnostic / Dev / Audit scripts (not core app) ──────────
+diag_db.py
+quick_scan.py
+full_refresh.py
+patch_dashboard_whale.py
+patch_dashboard_rl.py
+patch_dashboard.py
+news_diag*.py
+verify_*.py
+validate_*.py
+rl_backtest_compare.py
+whale_backtest_impact.py
+fix_*.py
+audit_*.py
+audit_*.json
+check_*.py
+debug_*.py
+deep_*.py
+master_*.py
+migrate_*.py
+system_audit.py
+system_health_report.txt
+db_audit.py
+db_summary.py
+trace_*.py
+ts_inspect.py
+tz_debug.py
+sim_*.py
+show_*.py
+read_*.py
+fast_grid.py
+final_check.py
+cleanup_stale.py
+backtest_*.txt
+ULTIMATE_*.txt
+VERIFICATION_*.txt
+test_*.py
+run_backtest*.py
+run_scanner.py
+run_self_learning.py
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+*.txt.log
+
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Pytest / Coverage ────────────────────────────────────────
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# ── Jupyter ──────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Data / Exports ───────────────────────────────────────────
+*.csv
+*.json.bak
+optimization_results.json
+
+# ── OS ───────────────────────────────────────────────────────
+desktop.ini
+.DS_Store
