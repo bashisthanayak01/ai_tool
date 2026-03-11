@@ -478,9 +478,40 @@ def run_whale_scan(symbols: List[str], db=None) -> List[Dict]:
 # DB helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ── Index setup (run once at startup, not on every save) ───────────────────
+_whale_indexes_created = False
+
+def _ensure_whale_indexes(db) -> None:
+    """Create whale_data indexes once. Safe to call multiple times (idempotent)."""
+    global _whale_indexes_created
+    if _whale_indexes_created:
+        return
+    try:
+        db['whale_data'].create_index(
+            [('symbol', 1), ('timestamp', -1)],
+            background=True, name='whale_sym_ts'
+        )
+        # TTL index: auto-delete docs older than 14 days
+        # NOTE: MongoDB only allows one TTL index per collection.
+        # If 'whale_data_ttl' already exists with different params, drop and recreate.
+        existing = db['whale_data'].index_information()
+        if 'whale_data_ttl' not in existing:
+            db['whale_data'].create_index(
+                [('timestamp', 1)],
+                expireAfterSeconds=14 * 24 * 3600,
+                background=True, name='whale_data_ttl'
+            )
+        _whale_indexes_created = True
+    except Exception as e:
+        logger.debug(f"[Whale] Index setup: {e}")
+
+
 def _save_whale_data(db, symbol: str, whale_result: Dict) -> bool:
     """Save whale metrics to whale_data collection."""
     try:
+        # Ensure indexes on first call (not every save)
+        _ensure_whale_indexes(db)
+
         doc = {
             'symbol':         symbol,
             'timestamp':      datetime.utcnow(),
@@ -502,15 +533,6 @@ def _save_whale_data(db, symbol: str, whale_result: Dict) -> bool:
             },
         }
         db['whale_data'].insert_one(doc)
-
-        # Ensure indexes
-        db['whale_data'].create_index(
-            [('symbol', 1), ('timestamp', -1)], background=True)
-        db['whale_data'].create_index(
-            [('timestamp', 1)],
-            expireAfterSeconds=14 * 24 * 3600,   # 14-day TTL
-            background=True, name='whale_data_ttl'
-        )
         return True
     except Exception as e:
         logger.error(f"[Whale] DB save error: {e}")

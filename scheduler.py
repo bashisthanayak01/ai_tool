@@ -326,9 +326,13 @@ def main():
 
     scheduler = BlockingScheduler()
 
-    # Every 5 min: full market scan (signals stored hourly via rule)
+    # Every 5 min: full market scan
+    # coalesce=True: if previous scan still running, skip redundant queued triggers
+    # max_instances=1: ONLY one scan allowed at a time — prevents parallel overlapping scans
+    # misfire_grace_time=120s: still fire if scheduler was briefly paused (e.g. startup delay)
     scheduler.add_job(run_scan, trigger=IntervalTrigger(minutes=5),
-                      id='scan', name='Market Scanner', replace_existing=True)
+                      id='scan', name='Market Scanner', replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=120)
 
     # Every hour: persist regime snapshot
     scheduler.add_job(save_regime_snapshot, trigger=IntervalTrigger(hours=1),
@@ -351,8 +355,10 @@ def main():
                       id='rl_learning', name='RL Optimizer', replace_existing=True)
 
     # Every 10 minutes: whale intelligence scan (top 30 symbols)
+    # coalesce=True: skip redundant queued runs (whale scan can take 2-3 min)
     scheduler.add_job(run_whale_scan_job, trigger=IntervalTrigger(minutes=10),
-                      id='whale_scan', name='Whale Intelligence', replace_existing=True)
+                      id='whale_scan', name='Whale Intelligence', replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=60)
 
     logger.info("[OK] Scheduler running.")
     logger.info("  - Market scan:         every 5 minutes")
