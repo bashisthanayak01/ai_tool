@@ -1,15 +1,21 @@
 """
-Scheduler v6 — 5-min scans + 10-min whale scan + hourly regime/signal storage +
-               daily RL learning + weekly self-learning + weekly auto-optimization
+Scheduler v7 — self-chaining scan (no overlap) + 10-min whale scan +
+               hourly regime + daily RL + weekly learning + weekly optimizer
 """
 
 import logging
+import threading
+import time as _time
 from datetime import datetime
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from services.market_pipeline import scan_market, save_to_mongodb, collect_historical_data
 from services.binance_scanner import get_top_symbols
+from services.signal_persistence import (
+    save_scan_snapshot, get_conviction_picks, save_conviction_picks,
+    setup_persistence_indexes
+)
 from database.mongo_client import mongo_client
 from ranking_engine import rank_coins, save_rankings
 from learning_engine import run_learning_cycle
@@ -27,7 +33,7 @@ _first_scan_done = False
 
 
 def initialize():
-    """Startup: setup indexes, collect historical data"""
+    """Startup: setup indexes (including persistence), collect historical data"""
     logger.info("=" * 60)
     logger.info("INITIALIZATION")
     logger.info("=" * 60)
@@ -37,6 +43,15 @@ def initialize():
 
     # Create/update indexes (safe to call multiple times)
     mongo_client.setup_indexes()
+
+    # v3: Create signal_persistence TTL + compound indexes
+    try:
+        import pymongo as _pymongo
+        _idx_client = _pymongo.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=8000)
+        setup_persistence_indexes(_idx_client[settings.DATABASE_NAME])
+        _idx_client.close()
+    except Exception as _ie:
+        logger.warning(f"[Init] Persistence index warning: {_ie}")
 
     # Show DB state
     sig_count = mongo_client.get_signal_count()
@@ -50,6 +65,35 @@ def initialize():
         stats = collect_historical_data(symbols)
         logger.info(f"Historical: +{stats['inserted']} new candles")
     return True
+# ── Self-chaining scan loop (runs in a background thread) ────────────────────
+# After each scan finishes (no matter how long), waits SCAN_PAUSE_SECONDS then
+# runs the next scan. This GUARANTEES no overlap and no 'max_instances' warnings.
+SCAN_PAUSE_SECONDS = 5 * 60   # wait 5 min between scans
+_scan_thread: threading.Thread | None = None
+_scan_running = threading.Event()  # set while a scan is in progress
+
+
+def _scan_loop():
+    """Background thread: run_scan → wait 5 min → run_scan → repeat forever."""
+    while True:
+        try:
+            _scan_running.set()
+            run_scan()
+        except Exception as e:
+            logger.error(f"[ScanLoop] Unexpected error: {e}")
+        finally:
+            _scan_running.clear()
+        logger.info(f"[ScanLoop] Next scan in {SCAN_PAUSE_SECONDS//60} min...")
+        _time.sleep(SCAN_PAUSE_SECONDS)
+
+
+def start_scan_loop():
+    """Start the self-chaining scan thread (daemon — dies when main process exits)."""
+    global _scan_thread
+    _scan_thread = threading.Thread(target=_scan_loop, daemon=True, name='ScanLoop')
+    _scan_thread.start()
+    logger.info("[ScanLoop] Started — scans run sequentially, 5 min gap after each completion")
+
 
 
 def run_scan():
@@ -72,37 +116,57 @@ def run_scan():
             return
 
         # Check if DB has any signals at all (bootstrap case)
-        # Use a fresh connection for this check to avoid interfering with the main mongo_client singleton
-        # which might be used by other concurrent jobs or later parts of this function.
-        from database.mongo_client import MongoClient
-        temp_mongo_client = MongoClient()
-        if not temp_mongo_client.connect():
-            force_save = not _first_scan_done
-        else:
-            sig_count = temp_mongo_client.get_signal_count()
-            temp_mongo_client.close() # Close the temporary connection
+        # Use a direct pymongo connection — avoids the shared singleton and
+        # correctly uses settings.MONGO_URI (not localhost).
+        try:
+            import pymongo as _pymongo_check
+            _check_client = _pymongo_check.MongoClient(
+                settings.MONGO_URI, serverSelectionTimeoutMS=10000
+            )
+            _check_db = _check_client[settings.DATABASE_NAME]
+            sig_count = _check_db[settings.COLLECTION_AI_SIGNALS].count_documents({})
+            _check_client.close()
             force_save = (sig_count == 0)
+        except Exception as _ce:
+            logger.warning(f"[Scan] DB check failed: {_ce} — using bootstrap flag")
+            force_save = not _first_scan_done
 
         saved = save_to_mongodb(results, force=force_save)
         _first_scan_done = True
 
-        # ── Ranking Engine: run after every scan — own dedicated connection ──
+        # ── Ranking Engine: rank from LIVE results — own dedicated connection ──
+        # Use live scan results directly (not a DB re-query) so batch_ts is
+        # ALWAYS updated after every scan, regardless of save_to_mongodb timing.
         try:
             import pymongo as _pymongo
-            from services.market_pipeline import get_latest_signals_from_db
-            _rank_client = _pymongo.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=10000)
+            _rank_client = _pymongo.MongoClient(
+                settings.MONGO_URI,
+                serverSelectionTimeoutMS=30000,
+                socketTimeoutMS=120000,
+                connectTimeoutMS=30000,
+            )
             _rank_db = _rank_client[settings.DATABASE_NAME]
-            # Use freshly-saved DB signals (consistent field format) rather than
-            # raw live scan results which may have edge-case field differences
-            db_signals = get_latest_signals_from_db(limit=90)
-            ranked = rank_coins(db_signals) if db_signals else rank_coins(results)
-            all_symbols = [r['symbol'] for r in (db_signals or results)]
+            ranked = rank_coins(results)          # rank from live results
+            all_symbols = [r['symbol'] for r in results]
             n_saved = save_rankings(ranked, _rank_db, all_scanned_symbols=all_symbols)
+
+            # v3: Save top-20 to signal_persistence for consistency tracking.
+            # This is the foundation of the High Conviction Board — after enough
+            # scans accumulate, get_conviction_picks() filters to find coins that
+            # have consistently appeared in top-10 over the last 2 hours.
+            if ranked:
+                try:
+                    n_persist = save_scan_snapshot(ranked[:20], db=_rank_db)
+                    logger.info(f"[Persistence] {n_persist} coins logged to signal_persistence")
+                except Exception as _pe:
+                    logger.warning(f"[Persistence] Snapshot save failed: {_pe}")
+
             _rank_client.close()
             if ranked:
                 top_r = ranked[0]
-                logger.info(f"[Ranking] Top coin: {top_r['symbol']} score={top_r['rank_score']}")
-            logger.info(f"[Ranking] Saved {n_saved}/{len(db_signals)} ranked coins")
+                logger.info(f"[Ranking] Top: {top_r['symbol']} score={top_r['rank_score']} "
+                            f"type={top_r.get('trade_type','SWING')}")
+            logger.info(f"[Ranking] {n_saved}/{len(ranked)} ranked coins saved (batch_ts updated)")
         except Exception as re:
             logger.error(f"[Ranking] Error: {type(re).__name__}: {re}", exc_info=True)
 
@@ -195,6 +259,37 @@ def save_regime_snapshot():
         )
     except Exception as e:
         logger.error(f"[RegimeSnapshot] Error: {e}")
+
+
+def run_conviction_update():
+    """
+    Hourly job: compute High Conviction Picks from the last 2 hours of
+    signal_persistence records and save them to conviction_picks collection.
+
+    Logic: A coin qualifies if it appeared in the top-10 in ≥5 of the last
+    8 scans (~2 hours). Results are classified into SWING / POSITION / TREND
+    buckets based on trade_type, hourly_trend, and position_score.
+
+    The dashboard reads conviction_picks to display the High Conviction Board
+    without re-computing on every page load.
+    """
+    logger.info("[Conviction] Computing High Conviction Picks from last 2h...")
+    try:
+        import pymongo as _pymongo
+        _cv_client = _pymongo.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=10000)
+        _cv_db = _cv_client[settings.DATABASE_NAME]
+        picks = get_conviction_picks(db=_cv_db)
+        save_conviction_picks(picks, db=_cv_db)
+        _cv_client.close()
+        meta = picks.get('metadata', {})
+        logger.info(
+            f"[Conviction] SWING={len(picks.get('SWING',[]))} "
+            f"POSITION={len(picks.get('POSITION',[]))} "
+            f"TREND={len(picks.get('TREND',[]))} "
+            f"({meta.get('scans_analysed',0)} scans analysed)"
+        )
+    except Exception as e:
+        logger.error(f"[Conviction] Error: {e}")
 
 
 def run_optimization_job():
@@ -297,11 +392,14 @@ def print_db_summary():
 
 def main():
     logger.info("=" * 60)
-    logger.info("CRYPTO AI ANALYTICS PLATFORM v6")
+    logger.info("CRYPTO AI ANALYTICS PLATFORM v7")
     logger.info("Signal history:        ENABLED (hourly snapshots, 90-day retention)")
     logger.info("News storage:          ENABLED (30-min cache, 30-day retention)")
-    logger.info("AI formula:            Tech(70%) + News(30%) + Whale(10pt) x Regime x RL")
+    logger.info("AI formula:            Tech(70%) + News(30%) + Whale(10pt) x Regime x RL x DailyTrend")
     logger.info("Regime multipliers:    BULL=1.10 | BEAR=0.80 | SIDEWAYS=0.95")
+    logger.info("Daily Trend Mult:      UPTREND=x1.15 | DOWNTREND=x0.85 | SIDEWAYS=x1.0 (90d DB candles)")
+    logger.info("Trade Types:           SWING (15m) | POSITION (1h+15m) | TREND (daily+1h+15m)")
+    logger.info("High Conviction Board: ENABLED (persistence tracking, >=5/8 scans in top-10)")
     logger.info("Whale Intelligence:    ENABLED (5-source: aggTrades+OB+ticker+klines+depth)")
     logger.info("RL Optimizer:          ENABLED (daily, clamped 0.80-1.20)")
     logger.info("Self-Learning:         ENABLED (weekly weight adaptation)")
@@ -326,17 +424,21 @@ def main():
 
     scheduler = BlockingScheduler()
 
-    # Every 5 min: full market scan
-    # coalesce=True: if previous scan still running, skip redundant queued triggers
-    # max_instances=1: ONLY one scan allowed at a time — prevents parallel overlapping scans
-    # misfire_grace_time=120s: still fire if scheduler was briefly paused (e.g. startup delay)
-    scheduler.add_job(run_scan, trigger=IntervalTrigger(minutes=5),
-                      id='scan', name='Market Scanner', replace_existing=True,
-                      max_instances=1, coalesce=True, misfire_grace_time=120)
+    # ── Scan: self-chaining thread loop ─────────────────────────────────────
+    # Runs scan → waits 5 min after completion → runs next scan.
+    # No overlap ever. No 'max_instances' warnings.
+    start_scan_loop()
 
-    # Every hour: persist regime snapshot
+    # Every hour: persist regime snapshot + compute conviction picks
     scheduler.add_job(save_regime_snapshot, trigger=IntervalTrigger(hours=1),
-                      id='regime_snapshot', name='Regime History', replace_existing=True)
+                      id='regime_snapshot', name='Regime History', replace_existing=True,
+                      max_instances=1, coalesce=True)
+
+    # Every hour: compute High Conviction Picks (needs >=4 scans of data first)
+    # Runs 30 min after the hour so it analyses data from completed scans.
+    scheduler.add_job(run_conviction_update, trigger=IntervalTrigger(minutes=30),
+                      id='conviction_update', name='High Conviction Picks', replace_existing=True,
+                      max_instances=1, coalesce=True)
 
     # Once per day at 02:00 UTC: cleanup old records
     scheduler.add_job(cleanup_old_data, trigger=IntervalTrigger(hours=24),
@@ -361,9 +463,9 @@ def main():
                       max_instances=1, coalesce=True, misfire_grace_time=60)
 
     logger.info("[OK] Scheduler running.")
-    logger.info("  - Market scan:         every 5 minutes")
+    logger.info("  - Market scan:         sequential thread (5-min gap after each scan completes)")
     logger.info("  - Whale scan:          every 10 minutes (top 30 symbols)")
-    logger.info("  - Signal storage:      once per hour (at minute :00)")
+    logger.info("  - Conviction picks:    every 30 minutes (SWING / POSITION / TREND board)")
     logger.info("  - Regime snapshot:     every 1 hour")
     logger.info("  - Data cleanup:        every 24 hours")
     logger.info("  - RL Learning:         every 24 hours")

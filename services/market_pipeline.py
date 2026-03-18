@@ -1,5 +1,14 @@
 """
-Market Pipeline v2 — all engines + hourly signal history storage + DB-backed news cache
+Market Pipeline v3 — all engines + multi-timeframe (SWING/POSITION/TREND) support
+
+v3 additions vs v2:
+  - Loads 90-day daily trend context from market_data DB (no new API call).
+    Applies trend_alignment_mult to final_score so signals aligned with the
+    big daily trend score higher; signals fighting the trend score lower.
+  - Fetches 1h candles per coin (200 bars = ~8 days) for POSITION trade detection.
+  - Labels every scan result with trade_type: SWING | POSITION | TREND
+  - Near_support/resistance/sr_quality now explicitly added to result dict
+    (were previously only in indicators sub-dict).
 """
 
 import logging
@@ -12,7 +21,7 @@ from services.indicator_engine import analyze_indicators
 from services.profit_score import calculate_profit_score
 from services.ai_score import calculate_final_score
 from ai.whale_tracker import detect_whale_activity          # upgraded v2
-from ai.multi_timeframe import get_mtf_confirmation         # NEW: 4h alignment
+from ai.multi_timeframe import get_mtf_confirmation         # 4h alignment
 from news.news_collector import get_news_sentiment
 from ai.market_regime import detect_market_regime
 from ai.probability_engine import calculate_probability
@@ -20,6 +29,9 @@ from ai.ranking_engine import rank_coins
 from risk_model import apply_risk_model
 from optimization.strategy_config import get_regime_adjusted_config
 from ai.rl_optimizer import get_current_rl_params
+# v3: multi-timeframe context
+from services.daily_context import get_daily_context        # 90-day daily trend (from DB)
+from services.hourly_analysis import get_hourly_analysis    # 1h candle analysis
 from config import settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -138,13 +150,52 @@ def scan_market(limit: int = 90) -> List[Dict]:
     scan_time = datetime.utcnow()
     mtf_cache: dict = {}   # shared 4h cache for multi-timeframe (1h TTL per symbol)
 
+    # ── v3: Load 90-day daily trend context ONCE per scan (fast DB read) ──────
+    # Reads from market_data collection — no new Binance API call needed.
+    # Returns a dict: {symbol: {daily_trend, trend_alignment_mult, ...}}
+    # Used to apply a multiplier to final_score: signals aligned with the daily
+    # uptrend get +15% boost; signals fighting the downtrend get -15% penalty.
+    try:
+        daily_ctx = get_daily_context(symbols, db=db)
+        logger.info(f"[v3] Daily context loaded for {len(daily_ctx)} symbols")
+    except Exception as _dce:
+        logger.warning(f"[v3] Daily context failed: {_dce} — using neutral multipliers")
+        daily_ctx = {}
+
     for i, sym in enumerate(symbols, 1):
         try:
-            # 2a: Klines (15m)
+            # 2a: Klines (15m, 200 bars = ~50h of data)
             klines = get_klines(sym, '15m', 200)
             if not klines:
                 failed += 1
                 continue
+
+            # 2a2: Compute 24h price change from klines.
+            # 200 candles × 15 min = 3000 min (~50h). 96 bars back = ~24h.
+            # Used by ranking_engine._compute_24h_gain_penalty_multiplier().
+            try:
+                bars_24h = 96   # 96 × 15m = 1440 min = 24h
+                if len(klines) >= bars_24h + 1:
+                    price_24h_ago = float(klines[-(bars_24h + 1)].get('close', 0) or 0)
+                else:
+                    price_24h_ago = float(klines[0].get('close', 0) or 0)
+                current_close = float(klines[-1].get('close', 0) or 0)
+                price_change_24h_pct = (
+                    ((current_close - price_24h_ago) / price_24h_ago) * 100.0
+                    if price_24h_ago > 0 else 0.0
+                )
+            except Exception:
+                price_change_24h_pct = 0.0
+
+            # 2a3: v3 — Hourly analysis for POSITION trade classification.
+            # Fetches 200 × 1h candles = ~8 days of hourly data.
+            # Returns: rsi_1h, ema20_1h, hourly_trend, hourly_momentum, position_score
+            try:
+                hourly = get_hourly_analysis(sym)
+            except Exception:
+                hourly = {'hourly_trend': 'SIDEWAYS', 'hourly_momentum': 'NEUTRAL',
+                          'position_score': 0.0, 'rsi_1h': 50.0}
+
 
             # 2b: Indicators
             indicators = analyze_indicators(klines)
@@ -270,7 +321,52 @@ def scan_market(limit: int = 90) -> List[Dict]:
                 'score_before_rl': score_before_rl,
                 'rl_weight':       round(rl_weight, 4),
                 'rl_adjusted_score': rl_adjusted,
+                # ── v2 Ranking Engine fields ─────────────────────────────────
+                'price_change_24h_pct': round(price_change_24h_pct, 2),
+                'near_support':     indicators.get('near_support', False),
+                'near_resistance':  indicators.get('near_resistance', False),
+                'sr_quality':       indicators.get('sr_quality', 0),
             }
+
+            # ── v3: Apply daily trend alignment multiplier ─────────────────
+            # If the coin is in a 90-day daily uptrend, boost final_score by 15%.
+            # If it's in a daily downtrend, reduce by 15%.
+            # Multiplier is 1.0 (neutral) when no daily data is available.
+            _dctx            = daily_ctx.get(sym, {})
+            _trend_mult      = float(_dctx.get('trend_alignment_mult', 1.0))
+            _daily_trend     = _dctx.get('daily_trend', 'SIDEWAYS')
+            _orig_score      = result['final_score']
+            result['final_score'] = round(_orig_score * _trend_mult, 2)
+            result['daily_trend']           = _daily_trend
+            result['trend_alignment_mult']  = _trend_mult
+            result['daily_ema20']           = _dctx.get('daily_ema20')
+            result['daily_ema50']           = _dctx.get('daily_ema50')
+            result['daily_support_zone']    = _dctx.get('daily_support_zone')
+            result['daily_resistance_zone'] = _dctx.get('daily_resistance_zone')
+            result['distance_from_ema20d']  = _dctx.get('distance_from_ema20d', 0.0)
+
+            # ── v3: Add hourly analysis fields ────────────────────────────
+            result['hourly_trend']    = hourly.get('hourly_trend', 'SIDEWAYS')
+            result['hourly_momentum'] = hourly.get('hourly_momentum', 'NEUTRAL')
+            result['position_score']  = hourly.get('position_score', 0.0)
+            result['rsi_1h']          = hourly.get('rsi_1h', 50.0)
+
+            # ── v3: Classify trade type ───────────────────────────────────
+            # TREND:    daily uptrend confirmed + strong 1h position setup
+            # POSITION: 1h uptrend + decent position_score
+            # SWING:    default (4-12h, 15m based, everything else)
+            #
+            # Note: A coin can qualify for multiple types. We pick the highest
+            # timeframe it qualifies for (TREND > POSITION > SWING).
+            _pos_score = result['position_score']
+            if (_daily_trend == 'UPTREND' and
+                    result['hourly_trend'] == 'UPTREND' and
+                    _pos_score >= 70):
+                result['trade_type'] = 'TREND'
+            elif (result['hourly_trend'] == 'UPTREND' and _pos_score >= 60):
+                result['trade_type'] = 'POSITION'
+            else:
+                result['trade_type'] = 'SWING'
 
             # 2h: Risk-Adjusted Score (NEW)
             # Computes volatility_penalty, drawdown_penalty, liquidity_bonus,
@@ -317,7 +413,12 @@ def save_to_mongodb(results: List[Dict], force: bool = False) -> bool:
         return True
 
     try:
-        _client = _pymongo.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=5000)
+        _client = _pymongo.MongoClient(
+            settings.MONGO_URI,
+            serverSelectionTimeoutMS=30000,   # 30s — scan takes 10+ min
+            socketTimeoutMS=120000,            # 2 min socket idle timeout
+            connectTimeoutMS=30000,
+        )
         _db = _client[settings.DATABASE_NAME]
         col = _db[settings.COLLECTION_AI_SIGNALS]
 

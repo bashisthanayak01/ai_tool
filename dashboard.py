@@ -391,7 +391,12 @@ def render_live_analytics():
     sig_count = stats.get('signal_count', 0)
     news_count = stats.get('news_count', 0)
     if latest_ts:
-        ts_str = latest_ts.strftime('%Y-%m-%d %H:%M UTC') if isinstance(latest_ts, datetime) else str(latest_ts)
+        if isinstance(latest_ts, datetime):
+            from datetime import timedelta
+            ts_ist = latest_ts + timedelta(hours=5, minutes=30)
+            ts_str = ts_ist.strftime('%Y-%m-%d %H:%M IST')
+        else:
+            ts_str = str(latest_ts)
         st.markdown(
             f'<span class="ts-badge">🕐 Last Signal: {ts_str} &nbsp;|&nbsp; '
             f'📊 {sig_count:,} signals stored &nbsp;|&nbsp; '
@@ -688,6 +693,140 @@ def render_top_opportunities():
                if last_ts is not None else "N/A"))
 
     st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 🎯 HIGH CONVICTION BOARD — v3 Multi-Timeframe (SWING / POSITION / TREND)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Shows coins that appeared consistently in top-10 across the last 2 hours
+    # of scans. Needs >= 5 scans to populate (starts filling after ~1.5 hours).
+    # The conviction_picks collection is updated every 30 minutes by the scheduler.
+    # ──────────────────────────────────────────────────────────────────────────
+    st.subheader("🎯 High Conviction Board")
+    st.caption(
+        "Coins that stayed in top-10 across ≥5 of last 8 scans (~2h). "
+        "**Far more reliable than a single-scan snapshot.** "
+        "Updates every 30 min · Needs ~1.5h of scan data to populate."
+    )
+
+    _conviction_picks = None
+    try:
+        import pymongo as _pym
+        _cv_uri    = __import__('config', fromlist=['settings']).settings.MONGO_URI
+        _cv_dbname = __import__('config', fromlist=['settings']).settings.DATABASE_NAME
+        _cv_client = _pym.MongoClient(_cv_uri, serverSelectionTimeoutMS=4000)
+        _cv_doc    = _cv_client[_cv_dbname]['conviction_picks'].find_one({}, {'_id': 0})
+        _cv_client.close()
+        if _cv_doc:
+            _conviction_picks = _cv_doc
+    except Exception:
+        pass
+
+    if _conviction_picks and any(
+        _conviction_picks.get(k) for k in ['swing', 'position', 'trend']
+    ):
+        _meta = _conviction_picks.get('metadata', {})
+        _n_scans = _meta.get('scans_analysed', 0)
+        _gen_at  = _conviction_picks.get('generated_at')
+        _age_str = ''
+        if _gen_at:
+            try:
+                _age_m = int((datetime.utcnow() - _gen_at.replace(tzinfo=None)).total_seconds() / 60)
+                _age_str = f" · Updated {_age_m} min ago"
+            except Exception:
+                pass
+        st.info(f"📊 Analysed **{_n_scans} scans** in last 2h{_age_str}", icon="📊")
+
+        _swing_picks    = _conviction_picks.get('swing', [])
+        _position_picks = _conviction_picks.get('position', [])
+        _trend_picks    = _conviction_picks.get('trend', [])
+
+        _c_sw, _c_po, _c_tr = st.columns(3)
+
+        # ── Helper: render one conviction pick card ────────────────────────
+        def _render_conviction_card(col, picks, label, emoji, hold_time, gain_range, color):
+            with col:
+                st.markdown(
+                    f"<div style='background:{color};border-radius:10px;padding:12px 14px 8px;"
+                    f"margin-bottom:8px;'>"
+                    f"<h4 style='margin:0;color:#fff;'>{emoji} {label}</h4>"
+                    f"<small style='color:rgba(255,255,255,0.75);'>"
+                    f"Hold: {hold_time} · Target: {gain_range}</small></div>",
+                    unsafe_allow_html=True
+                )
+                if not picks:
+                    st.caption("⏳ Not enough data yet — keep scheduler running")
+                    return
+                for p in picks[:3]:
+                    sym      = p.get('symbol', '?')
+                    score    = p.get('avg_rank_score') or p.get('avg_score', 0)
+                    streak   = p.get('streak', 0)
+                    appear   = p.get('appearances', 0)
+                    n_scans  = p.get('n_scans', 1)
+                    rr       = p.get('risk_reward_ratio')
+                    gain24   = p.get('price_change_24h_pct', 0) or 0
+                    entry    = p.get('entry_price')
+                    tp       = p.get('take_profit')
+                    sl       = p.get('stop_loss')
+                    daily    = p.get('daily_trend', '')
+                    pos_sc   = p.get('position_score', 0) or 0
+
+                    streak_bar = '🟢' * min(int(streak), 5) + '⬜' * max(0, 5 - min(int(streak), 5))
+                    consist    = f"{appear}/{n_scans} scans"
+                    rr_str     = f"R:R {float(rr):.1f}x" if rr is not None else ""
+                    trend_tag  = f" · {daily}" if daily and daily not in ('', 'SIDEWAYS') else ""
+
+                    coin_md = (
+                        f"**{sym}** &nbsp; `{float(score):.1f} pts`  \n"
+                        f"{streak_bar} Streak: **{streak}** &nbsp;|&nbsp; {consist}  \n"
+                        f"24h: {float(gain24):+.1f}%{trend_tag}"
+                        + (f" &nbsp;|&nbsp; {rr_str}" if rr_str else "")
+                    )
+                    st.markdown(coin_md)
+                    if entry and tp and sl:
+                        st.markdown(
+                            f"<small>Entry: `{entry:.4g}` &nbsp; TP: `{tp:.4g}` &nbsp; "
+                            f"SL: `{sl:.4g}` &nbsp; pos={pos_sc:.0f}</small>",
+                            unsafe_allow_html=True
+                        )
+                    st.markdown("---")
+
+
+        _render_conviction_card(
+            _c_sw, _swing_picks,    "SWING",    "⚡", "4–12h",    "+3–8%",  "#1565C0"
+        )
+        _render_conviction_card(
+            _c_po, _position_picks, "POSITION", "📈", "1–3 days", "+8–15%", "#2E7D32"
+        )
+        _render_conviction_card(
+            _c_tr, _trend_picks,    "TREND",    "🚀", "1–2 weeks","+15–40%","#6A1B9A"
+        )
+
+    else:
+        # Not enough scans yet — show informational placeholder
+        _c_sw, _c_po, _c_tr = st.columns(3)
+        for _col, _lbl, _em, _hold, _gain, _clr in [
+            (_c_sw, "SWING",    "⚡", "4–12h",    "+3–8%",   "#1565C0"),
+            (_c_po, "POSITION", "📈", "1–3 days", "+8–15%",  "#2E7D32"),
+            (_c_tr, "TREND",    "🚀", "1–2 weeks","+15–40%", "#6A1B9A"),
+        ]:
+            with _col:
+                st.markdown(
+                    f"<div style='background:{_clr};border-radius:10px;padding:12px 14px 8px;"
+                    f"margin-bottom:8px;'>"
+                    f"<h4 style='margin:0;color:#fff;'>{_em} {_lbl}</h4>"
+                    f"<small style='color:rgba(255,255,255,0.75);'>Hold: {_hold} · "
+                    f"Target: {_gain}</small></div>",
+                    unsafe_allow_html=True
+                )
+                st.caption("⏳ Populates after ~1.5h of scanning")
+
+    st.markdown("---")
+
+    # ── Live Scan Snapshot (Top 3 from most recent scan) ─────────────────────
+    # This shows the top 3 coins from the LAST scan only.
+    # Unlike the High Conviction Board above, this changes every scan.
+    # Use it to see what's hot RIGHT NOW — confirm with the board above before buying.
+    # ──────────────────────────────────────────────────────────────────────────
 
     # ── Top 3 Cards ──
     st.subheader("🥇 Top 3 Opportunities")
