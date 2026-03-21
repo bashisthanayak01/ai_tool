@@ -740,6 +740,51 @@ def render_top_opportunities():
         _position_picks = _conviction_picks.get('position', [])
         _trend_picks    = _conviction_picks.get('trend', [])
 
+        # ── Fix 4: BUY NOW alert — highlight best actionable pick ──────────
+        # Criteria: Streak ≥ 5 + R:R ≥ 1.5x + position_score > 70
+        # Scans all 3 columns, picks the highest-scored coin that qualifies.
+        _buy_candidates = []
+        for _p in (_swing_picks + _position_picks + _trend_picks):
+            _p_rr  = _p.get('risk_reward_ratio') or 0
+            _p_str = _p.get('streak', 0)
+            _p_pos = _p.get('position_score', 0) or 0
+            if float(_p_str) >= 5 and float(_p_rr) >= 1.5 and float(_p_pos) > 70:
+                _buy_candidates.append(_p)
+        if _buy_candidates:
+            _buy_candidates.sort(key=lambda x: x.get('avg_rank_score', 0), reverse=True)
+            _best = _buy_candidates[0]
+            _best_sym  = _best.get('symbol', '?')
+            _best_rr   = float(_best.get('risk_reward_ratio') or 0)
+            _best_str  = _best.get('streak', 0)
+            _best_sc   = float(_best.get('avg_rank_score', 0) or 0)
+            _best_tp   = _best.get('take_profit')
+            _best_en   = _best.get('entry_price')
+            _pct_to_tp = ''
+            if _best_tp and _best_en and float(_best_en) > 0:
+                _pct_to_tp = f" · +{(float(_best_tp)/float(_best_en)-1)*100:.1f}% to TP"
+            _best_type = _best.get('trade_type', 'SWING')
+            # Determine column from which list it came
+            for _blist, _blabel in [(_swing_picks,'SWING'),(_position_picks,'POSITION'),(_trend_picks,'TREND')]:
+                if any(x.get('symbol') == _best_sym for x in _blist):
+                    _best_type = _blabel
+                    break
+            st.markdown(
+                f"""
+                <div style='background:linear-gradient(90deg,#e65100,#ff6f00);
+                border-radius:10px;padding:14px 18px;margin-bottom:12px;
+                border-left:5px solid #fff3e0;'>
+                <span style='color:#fff3e0;font-size:0.8em;font-weight:600;
+                letter-spacing:1px;'>🚨 BUY NOW ALERT</span><br>
+                <span style='color:#ffffff;font-size:1.15em;font-weight:700;'>
+                {_best_sym}</span>
+                <span style='color:#ffe0b2;'>&nbsp;·&nbsp;{_best_sc:.1f} pts
+                &nbsp;·&nbsp;Streak {_best_str}
+                &nbsp;·&nbsp;R:R {_best_rr:.1f}x{_pct_to_tp}
+                &nbsp;·&nbsp;{_best_type}</span>
+                </div>""",
+                unsafe_allow_html=True
+            )
+
         _c_sw, _c_po, _c_tr = st.columns(3)
 
         # ── Helper: render one conviction pick card ────────────────────────
@@ -775,6 +820,12 @@ def render_top_opportunities():
                     rr_str     = f"R:R {float(rr):.1f}x" if rr is not None else ""
                     trend_tag  = f" · {daily}" if daily and daily not in ('', 'SIDEWAYS') else ""
 
+                    # Fix 3: compute +% remaining to TP
+                    tp_pct_str = ''
+                    if entry and tp and float(entry) > 0:
+                        tp_pct = (float(tp) / float(entry) - 1) * 100
+                        tp_pct_str = f"+{tp_pct:.1f}% to TP"
+
                     coin_md = (
                         f"**{sym}** &nbsp; `{float(score):.1f} pts`  \n"
                         f"{streak_bar} Streak: **{streak}** &nbsp;|&nbsp; {consist}  \n"
@@ -784,8 +835,10 @@ def render_top_opportunities():
                     st.markdown(coin_md)
                     if entry and tp and sl:
                         st.markdown(
-                            f"<small>Entry: `{entry:.4g}` &nbsp; TP: `{tp:.4g}` &nbsp; "
-                            f"SL: `{sl:.4g}` &nbsp; pos={pos_sc:.0f}</small>",
+                            f"<small>Entry: `{entry:.4g}` &nbsp; "
+                            + (f"**{tp_pct_str}** &nbsp; " if tp_pct_str else "")
+                            + f"TP: `{tp:.4g}` &nbsp; SL: `{sl:.4g}` "
+                            f"&nbsp; pos={pos_sc:.0f}</small>",
                             unsafe_allow_html=True
                         )
                     st.markdown("---")

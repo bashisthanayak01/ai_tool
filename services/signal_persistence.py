@@ -67,6 +67,7 @@ SWING_RSI_MIN        = 35.0
 SWING_RSI_MAX        = 72.0
 POSITION_SCORE_MIN   = 60.0   # Minimum position_score for POSITION picks
 TREND_ALIGN_REQUIRED = 'UPTREND'  # daily_trend must be UPTREND for TREND picks
+MIN_RR               = 1.5    # Minimum Risk:Reward ratio — skip coins where you risk more than you gain
 
 
 def save_scan_snapshot(ranked_coins: List[Dict], db=None) -> int:
@@ -230,6 +231,16 @@ def get_conviction_picks(db=None, lookback_hours: int = LOOKBACK_HOURS) -> Dict[
             pos_score    = float(latest.get('position_score', 0) or 0)
             gain_24h     = float(latest.get('price_change_24h_pct', 0) or 0)
             rsi          = float(latest.get('rsi', 50) or 50)
+            rr_value     = latest.get('risk_reward_ratio')  # May be None
+
+            # ── Fix 1: Skip coins with bad R:R (risk more than you gain) ─────────
+            # R:R < MIN_RR (1.5x) means TP is too close or SL is too wide.
+            # No point showing it — the math is against you before you even enter.
+            if rr_value is not None and float(rr_value) < MIN_RR:
+                logger.debug(
+                    f"[Persistence] {sym} skipped: R:R={rr_value:.2f} < MIN_RR={MIN_RR}"
+                )
+                continue
 
             pick = {
                 'symbol':           sym,
@@ -253,27 +264,34 @@ def get_conviction_picks(db=None, lookback_hours: int = LOOKBACK_HOURS) -> Dict[
                 'entry_price':      latest.get('entry_price'),
                 'stop_loss':        latest.get('stop_loss'),
                 'take_profit':      latest.get('take_profit'),
-                'risk_reward_ratio':latest.get('risk_reward_ratio'),
+                'risk_reward_ratio':rr_value,
             }
 
-            # ── Assign to EXACTLY ONE trade type bucket (highest priority wins) ─
-            # Priority: TREND (strictest, longest hold) > POSITION > SWING (default)
-            # This ensures each coin appears in only ONE column on the dashboard.
+            # ── Fix 2: Assign to EXACTLY ONE bucket — highest priority wins ──────
+            # Priority order: TREND (strictest) > POSITION > SWING (default)
+            # DOWNTREND coins are blocked from POSITION and TREND — only allowed
+            # in SWING because that's a same-day exit where trend matters less.
 
-            if (daily_trend == TREND_ALIGN_REQUIRED and
+            is_downtrend = (daily_trend == 'DOWNTREND')
+
+            if (not is_downtrend and
+                    daily_trend == TREND_ALIGN_REQUIRED and
                     pos_score >= POSITION_SCORE_MIN and
                     avg_pos <= 8):
-                # TREND: daily uptrend + 1h momentum + consistently high ranked
+                # TREND: daily UPTREND + strong 1h score + consistently top-ranked
                 picks['TREND'].append(pick)
 
-            elif (pos_score >= POSITION_SCORE_MIN and
+            elif (not is_downtrend and
+                      pos_score >= POSITION_SCORE_MIN and
                       latest.get('hourly_trend') == 'UPTREND'):
-                # POSITION: strong 1h uptrend + good position score (but no daily UPTREND)
+                # POSITION: strong 1h uptrend + good position score
+                # DOWNTREND blocked — holding 1–3 days against a falling trend is risky
                 picks['POSITION'].append(pick)
 
             elif (SWING_RSI_MIN <= rsi <= SWING_RSI_MAX and
                       gain_24h <= SWING_MAX_GAIN_24H):
-                # SWING: RSI in good range, not already pumped — default short-term pick
+                # SWING: RSI in range, not already pumped
+                # DOWNTREND coins CAN appear here — short same-day exit, trend less critical
                 picks['SWING'].append(pick)
 
         # Sort each bucket by avg_rank_score descending, keep top 5
