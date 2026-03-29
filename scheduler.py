@@ -16,6 +16,8 @@ from services.signal_persistence import (
     save_scan_snapshot, get_conviction_picks, save_conviction_picks,
     setup_persistence_indexes
 )
+from services.paper_trading import log_new_conviction_picks, check_open_trades
+from services.scan_time_analysis import get_best_scan_hours
 from database.mongo_client import mongo_client
 from ranking_engine import rank_coins, save_rankings
 from learning_engine import run_learning_cycle
@@ -176,6 +178,18 @@ def run_scan():
                     f"Prob={top['probability_up']}% | "
                     f"Stored={'YES' if saved else 'SKIPPED (hourly rule)'}")
 
+        # ── Paper Trading: check open trades against new prices ──
+        try:
+            import pymongo as _pymongo_pt
+            _pt_client = _pymongo_pt.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=10000)
+            _pt_db = _pt_client[settings.DATABASE_NAME]
+            closed_n = check_open_trades(_pt_db)
+            if closed_n:
+                logger.info(f"[PaperTrade] {closed_n} trades closed this scan")
+            _pt_client.close()
+        except Exception as _pte:
+            logger.warning(f"[PaperTrade] Check error: {_pte}")
+
     except Exception as e:
         logger.error(f"Scan error: {e}")
 
@@ -280,6 +294,18 @@ def run_conviction_update():
         _cv_db = _cv_client[settings.DATABASE_NAME]
         picks = get_conviction_picks(db=_cv_db)
         save_conviction_picks(picks, db=_cv_db)
+
+        # ── Paper Trading: auto-log new conviction picks ──
+        try:
+            _all_picks = {}
+            for tt in ['swing', 'position', 'trend']:
+                _all_picks[tt] = picks.get(tt, picks.get(tt.upper(), []))
+            n_new = log_new_conviction_picks(_all_picks, db=_cv_db)
+            if n_new:
+                logger.info(f"[PaperTrade] Opened {n_new} new paper trades from conviction picks")
+        except Exception as _pte:
+            logger.warning(f"[PaperTrade] Log picks error: {_pte}")
+
         _cv_client.close()
         meta = picks.get('metadata', {})
         logger.info(
@@ -290,6 +316,7 @@ def run_conviction_update():
         )
     except Exception as e:
         logger.error(f"[Conviction] Error: {e}")
+
 
 
 def run_optimization_job():

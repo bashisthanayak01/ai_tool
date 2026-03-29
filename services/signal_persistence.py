@@ -233,14 +233,25 @@ def get_conviction_picks(db=None, lookback_hours: int = LOOKBACK_HOURS) -> Dict[
             rsi          = float(latest.get('rsi', 50) or 50)
             rr_value     = latest.get('risk_reward_ratio')  # May be None
 
-            # ── Fix 1: Skip coins with bad R:R (risk more than you gain) ─────────
-            # R:R < MIN_RR (1.5x) means TP is too close or SL is too wide.
-            # No point showing it — the math is against you before you even enter.
-            if rr_value is not None and float(rr_value) < MIN_RR:
+            # ── Safety: recalculate R:R from entry/tp/sl if stored value is bad ──
+            _ep = float(latest.get('entry_price', 0) or 0)
+            _tp = float(latest.get('take_profit', 0) or 0)
+            _sl = float(latest.get('stop_loss', 0) or 0)
+            if _ep > 0 and _ep > _sl and _tp > _ep:
+                _computed_rr = round((_tp - _ep) / (_ep - _sl), 2)
+                if rr_value is None or float(rr_value) <= 0:
+                    rr_value = _computed_rr  # fix bad stored value
+
+            # ── Fix 1: Skip coins with confirmed bad R:R (risk more than you gain) ──────
+            # Only apply when rr_value is positive — a negative stored value means the
+            # upstream scanner computed it incorrectly (e.g. entry/tp/sl rounding issue).
+            # We pass through None or negative rr and let the bucket logic decide.
+            if rr_value is not None and float(rr_value) > 0 and float(rr_value) < MIN_RR:
                 logger.debug(
-                    f"[Persistence] {sym} skipped: R:R={rr_value:.2f} < MIN_RR={MIN_RR}"
+                    f"[Persistence] {sym} skipped: R:R={float(rr_value):.2f} < MIN_RR={MIN_RR}"
                 )
                 continue
+
 
             pick = {
                 'symbol':           sym,

@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 BINANCE_API = "https://api.binance.com"
 
 # ── Thresholds & weights ─────────────────────────────────────────────────────
-LARGE_TRADE_USDT      = 50_000      # trades >= this are "whale trades"
+LARGE_TRADE_USDT      = 50_000      # fallback threshold (per-coin Z-score used if history available)
 AGG_TRADES_LIMIT      = 500         # number of aggTrades to fetch
 DEPTH_LEVELS          = 20          # order book levels to check
 WHALE_WEIGHT          = 10          # % contribution to final_score (default)
+ZSCORE_LOOKBACK_DAYS  = 7           # days of history for per-coin baseline
+ZSCORE_SIGMA          = 2.0         # standard deviations above mean = whale trade
 
 # Component weights (must sum to 1.0)
 W_AGG       = 0.35
@@ -66,6 +68,47 @@ def _get(url: str, params: dict = None, retries: int = 3, timeout: int = 8) -> O
             logger.debug(f"[Whale] Request error ({attempt}): {e}")
             _time.sleep(1.5 * attempt)
     return None
+
+
+# ── Per-coin adaptive threshold (Z-score based) ───────────────────────────────
+_coin_threshold_cache: dict = {}
+_THRESHOLD_CACHE_TTL = 3600  # refresh every hour
+
+def _get_per_coin_threshold(symbol: str, db=None) -> float:
+    """
+    Adaptive whale trade threshold per coin using 7-day history.
+    Small-cap coins (low activity) get lower threshold; BTC/ETH get higher.
+    Falls back to LARGE_TRADE_USDT if no history in DB.
+    """
+    import time as _t
+    from datetime import datetime as _dt, timedelta as _td
+    now = _t.time()
+    cached = _coin_threshold_cache.get(symbol)
+    if cached and (now - cached[1]) < _THRESHOLD_CACHE_TTL:
+        return cached[0]
+    try:
+        if db is None:
+            return LARGE_TRADE_USDT
+        since = _dt.utcnow() - _td(days=ZSCORE_LOOKBACK_DAYS)
+        docs = list(db['whale_data'].find(
+            {'symbol': symbol, 'timestamp': {'$gte': since}},
+            {'_id': 0, 'whale_score': 1}
+        ).limit(300))
+        if len(docs) < 10:
+            return LARGE_TRADE_USDT
+        scores = [float(d.get('whale_score', 50)) for d in docs]
+        import statistics as _stats
+        mean_s = _stats.mean(scores)
+        # Scale threshold by coin's typical activity level
+        # mean_score 50 (neutral) -> 1x default; 80 (active) -> 1.33x; 30 (quiet) -> 0.5x
+        threshold = LARGE_TRADE_USDT * max(0.1, mean_s / 50.0)
+        threshold = max(5_000, min(500_000, threshold))  # clamp $5k–$500k
+        _coin_threshold_cache[symbol] = (threshold, now)
+        logger.debug(f"[Whale/ZScore] {symbol}: adaptive=${threshold:,.0f} (mean={mean_s:.1f})")
+        return threshold
+    except Exception as e:
+        logger.debug(f"[Whale/ZScore] fallback {symbol}: {e}")
+        return LARGE_TRADE_USDT
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -96,6 +139,9 @@ def _fetch_agg_trades(symbol: str) -> Dict:
         large_sell_vol = 0.0
         large_count    = 0
 
+        # Fix 3: use per-coin adaptive threshold instead of fixed $50k
+        _adaptive_thresh = _get_per_coin_threshold(symbol)
+
         for t in data:
             qty   = float(t.get('q', 0))
             price = float(t.get('p', 0))
@@ -104,12 +150,12 @@ def _fetch_agg_trades(symbol: str) -> Dict:
 
             if is_sell:
                 total_sell_vol += notional
-                if notional >= LARGE_TRADE_USDT:
+                if notional >= _adaptive_thresh:
                     large_sell_vol += notional
                     large_count += 1
             else:
                 total_buy_vol += notional
-                if notional >= LARGE_TRADE_USDT:
+                if notional >= _adaptive_thresh:
                     large_buy_vol += notional
                     large_count += 1
 

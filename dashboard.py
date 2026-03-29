@@ -346,13 +346,15 @@ def main():
     st.title("🚀 Crypto AI Analytics Platform")
 
     # ═══════ TAB NAVIGATION ═══════
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "📡 Live Analytics",
         "🏆 Top Opportunities",
         "📊 Backtesting",
         "🧠 AI Learning",
         "🎯 Strategy Intelligence",
         "🐋 Whale Intelligence",
+        "📋 Paper Trading",
+        "⏰ Best Scan Hours",
     ])
 
     with tab1:
@@ -372,6 +374,12 @@ def main():
 
     with tab6:
         render_whale_panel()
+
+    with tab7:
+        render_paper_trading_panel()
+
+    with tab8:
+        render_scan_time_panel()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -687,9 +695,15 @@ def render_top_opportunities():
     s1.metric("🎯 Ranked Coins",    total)
     s2.metric("🟢 BUY Signals",     buy_c)
     s3.metric("🟡 HOLD Signals",    hold_c)
+    def _fmt_ist(dt):
+        from zoneinfo import ZoneInfo as _ZI
+        import datetime as _dt
+        ist_dt = dt.replace(tzinfo=_dt.timezone.utc).astimezone(_ZI('Asia/Kolkata'))
+        h = ist_dt.strftime('%I').lstrip('0') or '12'
+        return ist_dt.strftime(f'{h}:%M %p IST')
     s4.metric("🕐 Last Scan",
               f"{int(data_age_min)} min ago" if data_age_min is not None else
-              (last_ts.strftime('%H:%M UTC') if isinstance(last_ts, datetime) else str(last_ts)[:16]
+              (_fmt_ist(last_ts) if isinstance(last_ts, datetime) else str(last_ts)[:16]
                if last_ts is not None else "N/A"))
 
     st.markdown("---")
@@ -746,6 +760,13 @@ def render_top_opportunities():
         _buy_candidates = []
         for _p in (_swing_picks + _position_picks + _trend_picks):
             _p_rr  = _p.get('risk_reward_ratio') or 0
+            # Safety: recalculate R:R from entry/tp/sl if stored value is bad
+            if float(_p_rr) <= 0:
+                _pre = float(_p.get('entry_price') or 0)
+                _ptp = float(_p.get('take_profit') or 0)
+                _psl = float(_p.get('stop_loss') or 0)
+                if _pre > 0 and _pre > _psl and _ptp > _pre:
+                    _p_rr = round((_ptp - _pre) / (_pre - _psl), 2)
             _p_str = _p.get('streak', 0)
             _p_pos = _p.get('position_score', 0) or 0
             if float(_p_str) >= 5 and float(_p_rr) >= 1.5 and float(_p_pos) > 70:
@@ -808,10 +829,15 @@ def render_top_opportunities():
                     appear   = p.get('appearances', 0)
                     n_scans  = p.get('n_scans', 1)
                     rr       = p.get('risk_reward_ratio')
-                    gain24   = p.get('price_change_24h_pct', 0) or 0
                     entry    = p.get('entry_price')
                     tp       = p.get('take_profit')
                     sl       = p.get('stop_loss')
+                    # Safety: recalculate R:R if stored value is bad
+                    if (rr is None or float(rr) <= 0) and entry and tp and sl:
+                        _e = float(entry); _t = float(tp); _s = float(sl)
+                        if _e > 0 and _e > _s and _t > _e:
+                            rr = round((_t - _e) / (_e - _s), 2)
+                    gain24   = p.get('price_change_24h_pct', 0) or 0
                     daily    = p.get('daily_trend', '')
                     pos_sc   = p.get('position_score', 0) or 0
 
@@ -1828,6 +1854,175 @@ def render_strategy_intelligence():
                 st.error(f"Error: {ex}")
 
 
+
+# ══════════════════════════════════════════════════════════════
+# PAPER TRADING P&L PANEL
+# ══════════════════════════════════════════════════════════════
+
+def render_paper_trading_panel():
+    """Auto paper trade tracking panel — no manual input needed."""
+    st.markdown("## 📋 Paper Trading P&L (Auto-Tracked)")
+    st.caption("Every conviction pick is automatically logged and tracked. WIN = price hit TP. LOSS = price hit SL. EXPIRED = 72h timeout.")
+
+    try:
+        import pymongo as _pm
+        from services.paper_trading import get_paper_trade_summary
+        client = _pm.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=8000)
+        db = client[settings.DATABASE_NAME]
+        summary = get_paper_trade_summary(db, days=30)
+        client.close()
+    except Exception as ex:
+        st.error(f"Paper trading data unavailable: {ex}")
+        return
+
+    if not summary or summary.get('total_trades', 0) == 0:
+        st.info("No paper trades yet. Starts automatically when conviction picks are generated (next conviction job run).")
+        return
+
+    # ── Summary metrics ──
+    wr = summary.get('win_rate_pct', 0)
+    total_pnl = summary.get('total_pnl_pct', 0)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        st.metric("Total Trades", summary.get('total_trades', 0))
+    with m2:
+        st.metric("Open", summary.get('open_count', 0))
+    with m3:
+        wr_color = "normal" if wr >= 50 else "inverse"
+        st.metric("Win Rate", f"{wr:.1f}%", delta=f"{'Above' if wr>=50 else 'Below'} 50%")
+    with m4:
+        st.metric("Wins / Losses", f"{summary.get('win_count',0)}W / {summary.get('loss_count',0)}L")
+    with m5:
+        pnl_color = "normal" if total_pnl >= 0 else "inverse"
+        st.metric("Total P&L", f"{total_pnl:+.1f}%", delta=f"Avg win: {summary.get('avg_win_pct',0):+.1f}%")
+
+    # ── Overall verdict ──
+    if wr >= 60:
+        st.success(f"🎯 Strong performance! Win rate {wr:.1f}% — signals are reliable")
+    elif wr >= 50:
+        st.info(f"📊 Decent performance. Win rate {wr:.1f}%")
+    else:
+        st.warning(f"⚠️ Win rate {wr:.1f}% — signals need recalibration")
+
+    st.divider()
+
+    # ── Open trades ──
+    open_t = summary.get('open_trades', [])
+    if open_t:
+        st.markdown(f"### 🟡 Open Trades ({len(open_t)})")
+        rows = []
+        for t in open_t:
+            # Safety: recalculate R:R if stored value is bad
+            _rr = t.get('risk_reward')
+            if not _rr or float(_rr) <= 0:
+                _e2 = float(t.get('entry_price', 0) or 0)
+                _t2 = float(t.get('take_profit', 0) or 0)
+                _s2 = float(t.get('stop_loss', 0) or 0)
+                if _e2 > 0 and _e2 > _s2 and _t2 > _e2:
+                    _rr = round((_t2 - _e2) / (_e2 - _s2), 2)
+            rows.append({
+                'Symbol': t.get('symbol', '?'),
+                'Type': t.get('trade_type', '?'),
+                'Entry': f"{t.get('entry_price', 0):.6g}",
+                'TP': f"{t.get('take_profit', 0):.6g}",
+                'SL': f"{t.get('stop_loss', 0):.6g}",
+                'Expected +%': f"+{t.get('expected_tp_pct', 0):.1f}%",
+                'R:R': f"{float(_rr):.1f}" if _rr else '-',
+                'Opened (IST)': t.get('opened_ist', '?'),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # ── Recent closed trades ──
+    closed = summary.get('closed_trades', [])
+    if closed:
+        st.markdown("### 📚 Recent Closed Trades")
+        rows2 = []
+        for t in closed:
+            outcome = t.get('outcome', '?')
+            pnl = t.get('actual_pnl_pct', 0) or 0
+            rows2.append({
+                'Symbol': t.get('symbol', '?'),
+                'Type': t.get('trade_type', '?'),
+                'Outcome': outcome,
+                'P&L': f"{pnl:+.2f}%",
+                'Held (h)': f"{t.get('hold_hours', 0):.0f}h",
+                'Closed (IST)': t.get('closed_ist', '?'),
+            })
+        df2 = pd.DataFrame(rows2)
+        def highlight_outcome(row):
+            color = '#1a4d2e' if row['Outcome'] == 'WIN' else '#4d1a1a' if row['Outcome'] == 'LOSS' else '#333'
+            return [f'background-color: {color}'] * len(row)
+        st.dataframe(df2.style.apply(highlight_outcome, axis=1), use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════
+# BEST SCAN TIME ANALYSIS (IST)
+# ══════════════════════════════════════════════════════════════
+
+def render_scan_time_panel():
+    """Best IST trading hours based on historical signal win rates."""
+    st.markdown("## ⏰ Best Scan Hours (IST)")
+    st.caption("Which hours of the day (IST) historically produce BUY signals that go on to gain 4%+ within 24h?")
+
+    try:
+        import pymongo as _pm
+        from services.scan_time_analysis import get_best_scan_hours
+        import plotly.graph_objects as go
+        client = _pm.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=8000)
+        db = client[settings.DATABASE_NAME]
+        data = get_best_scan_hours(db, lookback_days=2)
+        client.close()
+    except Exception as ex:
+        st.error(f"Scan time analysis unavailable: {ex}")
+        return
+
+    if not data or not data.get('chart_data'):
+        st.info("Insufficient data for scan time analysis (need 2 days of BUY signals with outcomes).")
+        return
+
+    chart = data['chart_data']
+    best  = data.get('best_hours_ist', [])
+    worst = data.get('worst_hours_ist', [])
+
+    # Best hours highlight
+    if best:
+        best_labels = [f"{h:02d}:00 IST" for h in best[:3]]
+        st.success(f"🏆 **Best hours to scan:** {', '.join(best_labels)}")
+    if worst:
+        worst_labels = [f"{h:02d}:00 IST" for h in worst]
+        st.warning(f"⚠️ **Avoid these hours:** {', '.join(worst_labels)} (lowest win rate)")
+
+    # Bar chart
+    hours  = [c['label_ist'] for c in chart]
+    rates  = [c['win_rate'] for c in chart]
+    counts = [c['count'] for c in chart]
+    colors = [
+        'rgba(76,175,80,0.85)' if c['hour_ist'] in best else
+        'rgba(244,67,54,0.70)' if c['hour_ist'] in worst else
+        'rgba(66,133,244,0.65)' for c in chart
+    ]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=hours, y=rates, marker_color=colors,
+        text=[f"{r:.0f}%<br>({n})" for r, n in zip(rates, counts)],
+        textposition='outside', name='Win Rate %'
+    ))
+    fig.add_hline(y=50, line_dash='dash', line_color='#ffc107',
+                  annotation_text='50% baseline')
+    fig.update_layout(
+        height=320,
+        yaxis=dict(title='Win Rate %', range=[0, 100], gridcolor='#1e2a40'),
+        xaxis=dict(title='Hour (IST)', gridcolor='#1e2a40'),
+        plot_bgcolor='#0e1117', paper_bgcolor='#0e1117',
+        font=dict(color='white'), margin=dict(l=0, r=0, t=20, b=0),
+        legend=dict(bgcolor='rgba(0,0,0,0)')
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"Analysis based on {data.get('signals_analysed', 0)} BUY signals over last 2 days.")
+
+
 # ══════════════════════════════════════════════════════════════
 # WHALE INTELLIGENCE PANEL
 # ══════════════════════════════════════════════════════════════
@@ -1836,6 +2031,7 @@ def render_whale_panel():
     """Whale Intelligence tab content."""
     st.markdown("## 🐋 Whale Intelligence")
     st.caption("Real-time large capital movement detection from aggTrades, order book, exchange flow, and depth analysis.")
+
 
     whale_docs = load_whale_data(limit=30)
 

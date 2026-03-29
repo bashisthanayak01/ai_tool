@@ -117,9 +117,15 @@ def run_learning_cycle(db=None, lookback_days: int = LEARNING_LOOKBACK_DAYS) -> 
         current   = _load_current_weights(db)
         old_backup = {k: round(v, 6) for k, v in current.items()}
 
-        # ── Step 6: Derive new weights from win rates ──
-        new_weights  = _compute_new_weights(current, stats)
+        # ── Step 6: Derive new weights — XGBoost first, statistical fallback ──
+        new_weights  = _compute_new_weights_xgb(trade_outcomes, current)
         improvements = _describe_improvements(current, new_weights, stats)
+
+        # ── Step 7: Per-coin learning (top 10 most-traded coins) ──
+        try:
+            run_per_coin_learning(db, trade_outcomes, top_n=10)
+        except Exception as _pce:
+            logger.warning(f"[Learning] Per-coin learning error: {_pce}")
 
         # ── Step 7: Persist ──
         cycle_ts = datetime.utcnow()
@@ -594,8 +600,195 @@ def _empty_result() -> Dict:
 
 
 # ══════════════════════════════════════════════════════════════
-# STANDALONE RUNNER
+# FIX 2: XGBOOST LEARNING ENGINE
 # ══════════════════════════════════════════════════════════════
+
+MIN_XGB_SAMPLES = 50   # need this many resolved outcomes to use XGBoost
+
+def _compute_new_weights_xgb(outcomes: List[Dict], current: Dict) -> Dict:
+    """
+    Fix 2: XGBoost-based weight computation.
+    Trains a binary classifier (WIN=1, LOSS=0) on indicator feature combinations.
+    Uses feature_importances_ as the new indicator weights.
+    Falls back to statistical _compute_new_weights() if < MIN_XGB_SAMPLES.
+
+    Features: rsi_bull, ema_cross, macd_bull, vol_high, news_pos, prob (normalised)
+    """
+    resolved = [o for o in outcomes if o.get('outcome') in ('WIN', 'LOSS')]
+    if len(resolved) < MIN_XGB_SAMPLES:
+        logger.info(f"[XGBoost] Only {len(resolved)} samples — using statistical fallback")
+        stats = _analyse_indicators(outcomes)
+        return _compute_new_weights(current, stats)
+
+    try:
+        import numpy as np
+        from xgboost import XGBClassifier
+        from sklearn.model_selection import cross_val_score
+
+        FEATURES = ['rsi_bull', 'ema_cross', 'macd_bull', 'vol_high', 'news_pos']
+
+        X = np.array([
+            [int(o.get(f, False)) for f in FEATURES] + [float(o.get('prob', 50)) / 100.0]
+            for o in resolved
+        ], dtype=float)
+        y = np.array([1 if o['outcome'] == 'WIN' else 0 for o in resolved])
+
+        xgb = XGBClassifier(
+            n_estimators=100,
+            max_depth=3,
+            learning_rate=0.1,
+            use_label_encoder=False,
+            eval_metric='logloss',
+            random_state=42,
+            verbosity=0,
+        )
+
+        # Cross-validate to check if model is meaningful
+        if len(resolved) >= 100:
+            cv_scores = cross_val_score(xgb, X, y, cv=5, scoring='roc_auc')
+            auc = cv_scores.mean()
+            logger.info(f"[XGBoost] CV AUC={auc:.3f} on {len(resolved)} samples")
+        else:
+            auc = 0.5  # not enough for CV
+
+        xgb.fit(X, y)
+        importances = xgb.feature_importances_   # shape: [n_features]
+
+        # Map importances to weight keys
+        feat_names = FEATURES + ['probability']
+        weight_map = {
+            'rsi_bull':  'rsi',
+            'ema_cross': 'ema',
+            'macd_bull': 'macd',
+            'vol_high':  'volume',
+            'news_pos':  'news',
+            'probability': 'probability',
+        }
+
+        # Build raw weights from feature importance
+        raw = {}
+        for i, feat in enumerate(feat_names):
+            key = weight_map.get(feat, feat)
+            if key in current:
+                raw[key] = max(0.02, float(importances[i]))
+
+        # Blend with current weights (70% XGBoost, 30% current) for stability
+        # This prevents drastic swings in a single cycle
+        blended = {}
+        for key in current:
+            xgb_w = raw.get(key, current[key])
+            blended[key] = 0.70 * xgb_w + 0.30 * current[key]
+
+        # Apply ±10% change cap (same safety as statistical method)
+        capped = {}
+        for key in current:
+            cur = current[key]
+            new_w = blended[key]
+            delta = new_w - cur
+            if abs(delta) > MAX_WEIGHT_CHANGE_PCT:
+                new_w = cur + (MAX_WEIGHT_CHANGE_PCT * (1 if delta > 0 else -1))
+            capped[key] = max(0.02, new_w)
+
+        # Normalise to sum = 1.0
+        total = sum(capped.values())
+        if total > 0:
+            capped = {k: round(v / total, 6) for k, v in capped.items()}
+
+        logger.info(f"[XGBoost] New weights: {capped} (AUC={auc:.3f})")
+        return capped
+
+    except ImportError:
+        logger.warning("[XGBoost] xgboost not installed — using statistical fallback")
+        stats = _analyse_indicators(outcomes)
+        return _compute_new_weights(current, stats)
+    except Exception as e:
+        logger.error(f"[XGBoost] Training error: {e} — using statistical fallback")
+        stats = _analyse_indicators(outcomes)
+        return _compute_new_weights(current, stats)
+
+
+# ══════════════════════════════════════════════════════════════
+# FIX 6: PER-COIN LEARNING
+# ══════════════════════════════════════════════════════════════
+
+def run_per_coin_learning(db, outcomes_all: List[Dict],
+                          top_n: int = 10) -> Dict:
+    """
+    Fix 6: Train separate XGBoost models for the top_n most-traded coins.
+    Stores per-coin weights in model_weights with type='per_coin'.
+    Returns dict: {symbol: weights_dict}
+    """
+    if not outcomes_all:
+        return {}
+
+    # Count symbols
+    from collections import Counter
+    sym_counts = Counter(o['symbol'] for o in outcomes_all if o.get('symbol'))
+    top_symbols = [s for s, _ in sym_counts.most_common(top_n)]
+
+    per_coin_weights = {}
+    cycle_ts = datetime.utcnow()
+    global_weights = _load_current_weights(db)
+
+    for sym in top_symbols:
+        coin_outcomes = [o for o in outcomes_all if o.get('symbol') == sym]
+        resolved = [o for o in coin_outcomes if o.get('outcome') in ('WIN', 'LOSS')]
+
+        if len(resolved) < 20:
+            logger.debug(f"[PerCoin] {sym}: only {len(resolved)} samples — skipping")
+            continue
+
+        weights = _compute_new_weights_xgb(coin_outcomes, global_weights)
+        per_coin_weights[sym] = weights
+
+        # Save to DB
+        try:
+            db[COLL_MODEL_WEIGHTS].update_one(
+                {'type': 'per_coin', 'symbol': sym},
+                {'$set': {
+                    'type':       'per_coin',
+                    'symbol':     sym,
+                    'weights':    weights,
+                    'cycle_ts':   cycle_ts,
+                    'updated_at': datetime.utcnow(),
+                    'sample_count': len(resolved),
+                }},
+                upsert=True
+            )
+            logger.info(f"[PerCoin] {sym}: weights saved ({len(resolved)} samples)")
+        except Exception as e:
+            logger.error(f"[PerCoin] DB save error {sym}: {e}")
+
+    logger.info(f"[PerCoin] Trained {len(per_coin_weights)}/{len(top_symbols)} coins")
+    return per_coin_weights
+
+
+def get_current_weights(db=None, symbol: str = None) -> Dict:
+    """
+    Enhanced: check per-coin weights first (if symbol provided), fall back to global.
+    Used by ranking_engine to get the best weights for a specific coin.
+    """
+    own_conn = (db is None)
+    if own_conn:
+        client = pymongo.MongoClient(settings.MONGO_URI, serverSelectionTimeoutMS=8000)
+        db = client[settings.DATABASE_NAME]
+    try:
+        # Try per-coin first
+        if symbol:
+            doc = db[COLL_MODEL_WEIGHTS].find_one(
+                {'type': 'per_coin', 'symbol': symbol},
+                {'_id': 0, 'weights': 1}
+            )
+            if doc and doc.get('weights'):
+                logger.debug(f"[Weights] Using per-coin weights for {symbol}")
+                return doc['weights']
+        # Fall back to global
+        return _load_current_weights(db)
+    finally:
+        if own_conn:
+            client.close()
+
+
 
 if __name__ == '__main__':
     import json
