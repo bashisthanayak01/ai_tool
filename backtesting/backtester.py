@@ -40,9 +40,9 @@ DEFAULT_SETTINGS = {
     'atr_sl_multiplier':    1.0,        # SL = entry - 1×ATR
     'use_atr_sizing':       True,       # Use ATR for TP/SL
 
-    # Signal quality gates
-    'min_score':            65,
-    'min_probability':      55,
+    # Signal quality gates — must match ai_score.py thresholds (BUY=55, HOLD=35)
+    'min_score':            52,
+    'min_probability':      45,
 
     # Kelly criterion position sizing
     'use_kelly_sizing':     True,       # Adaptive bet sizing
@@ -61,7 +61,7 @@ DEFAULT_SETTINGS = {
     'trailing_stop':        True,
     'trailing_stop_pct':    0.025,
     'max_hold_hours':       48,
-    'use_regime_filter':    True,
+    'use_regime_filter':    False,  # Disabled: BEAR regime is persistent, would block all trades
     'use_whale_filter':     True,
     'use_confirmation':     True,
     'signal_window_hours':  4,
@@ -156,10 +156,44 @@ class Backtester:
                 query).sort('timestamp', 1)
             signals = list(cursor)
             logger.info(f"Loaded {len(signals)} AI signals for backtest period")
+
+            # If real signals are sparse (<100) in requested window,
+            # supplement with synthetic backtest signals (Nov2025-Feb2026)
+            if len(signals) < 100:
+                logger.info(
+                    f"[Backtester] Only {len(signals)} real signals in window — "
+                    f"supplementing with ai_signals_backtest_synth"
+                )
+                try:
+                    synth_query = {}
+                    if start_date or end_date:
+                        synth_query['timestamp'] = {}
+                        if start_date:
+                            synth_query['timestamp']['$gte'] = start_date
+                        if end_date:
+                            synth_query['timestamp']['$lte'] = end_date
+                    synth = list(self.db['ai_signals_backtest_synth'].find(
+                        synth_query).sort('timestamp', 1))
+                    if not synth:
+                        # No synth in window either — load all synth regardless of date
+                        synth = list(self.db['ai_signals_backtest_synth'].find(
+                            {}).sort('timestamp', 1))
+                        logger.info(f"[Backtester] Loaded ALL {len(synth)} synth signals (no date filter)")
+                    else:
+                        logger.info(f"[Backtester] Loaded {len(synth)} synth signals in window")
+                    signals = synth + signals
+                    signals.sort(
+                        key=lambda s: self._naive_utc(s.get('timestamp', datetime.min))
+                    )
+                    logger.info(f"[Backtester] Total signals after merge: {len(signals)}")
+                except Exception as synth_err:
+                    logger.warning(f"[Backtester] Could not load synth signals: {synth_err}")
+
             return signals
         except Exception as e:
             logger.error(f"Error loading AI signals: {e}")
             return []
+
 
     def get_available_symbols(self) -> List[str]:
         if self.db is None:

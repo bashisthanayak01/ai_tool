@@ -64,10 +64,10 @@ def get_db_connection():
 
 @st.cache_data(ttl=60)
 def load_signals():
-    """Load latest signal per symbol via aggregation pipeline"""
+    """Load latest signal per symbol and merge ranked_opportunities for top_rank field"""
     try:
         client, db = get_db_connection()
-        # Use aggregation to get latest signal per symbol
+        # idx_signal_lookup index on (symbol, timestamp DESC) handles sort with no RAM limit
         pipeline = [
             {'$sort': {'timestamp': -1}},
             {'$group': {
@@ -78,6 +78,22 @@ def load_signals():
             {'$sort': {'final_score': -1}}
         ]
         signals = list(db[settings.COLLECTION_AI_SIGNALS].aggregate(pipeline))
+
+        # Merge top_rank from ranked_opportunities (stored separately by ranking engine)
+        try:
+            ranked = list(db['ranked_opportunities'].find(
+                {}, {'symbol': 1, 'top_rank': 1, 'rank_score': 1, 'opportunity_score': 1, '_id': 0}
+            ))
+            rank_map = {r['symbol']: r for r in ranked}
+            for s in signals:
+                sym = s.get('symbol', '')
+                if sym in rank_map:
+                    s['top_rank'] = rank_map[sym].get('top_rank')
+                    s['rank_score'] = rank_map[sym].get('rank_score', s.get('rank_score', 0))
+                    s['opportunity_score'] = rank_map[sym].get('opportunity_score', s.get('opportunity_score', 0))
+        except Exception:
+            pass  # ranking merge is optional — signals still show without it
+
         client.close()
         return pd.DataFrame(signals) if signals else pd.DataFrame()
     except Exception as e:
@@ -317,7 +333,7 @@ def load_whale_data(limit: int = 20):
             {'$sort': {'whale_score': -1}},
             {'$limit': limit},
         ]
-        docs = list(db['whale_data'].aggregate(pipeline))
+        docs = list(db['whale_data'].aggregate(pipeline, allowDiskUse=True))
         client.close()
         return docs
     except Exception:
@@ -1931,7 +1947,7 @@ def render_paper_trading_panel():
                 'R:R': f"{float(_rr):.1f}" if _rr else '-',
                 'Opened (IST)': t.get('opened_ist', '?'),
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), width="stretch")
 
     # ── Recent closed trades ──
     closed = summary.get('closed_trades', [])
@@ -1953,7 +1969,7 @@ def render_paper_trading_panel():
         def highlight_outcome(row):
             color = '#1a4d2e' if row['Outcome'] == 'WIN' else '#4d1a1a' if row['Outcome'] == 'LOSS' else '#333'
             return [f'background-color: {color}'] * len(row)
-        st.dataframe(df2.style.apply(highlight_outcome, axis=1), use_container_width=True)
+        st.dataframe(df2.style.apply(highlight_outcome, axis=1), width="stretch")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2019,7 +2035,7 @@ def render_scan_time_panel():
         font=dict(color='white'), margin=dict(l=0, r=0, t=20, b=0),
         legend=dict(bgcolor='rgba(0,0,0,0)')
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
     st.caption(f"Analysis based on {data.get('signals_analysed', 0)} BUY signals over last 2 days.")
 
 
@@ -2151,7 +2167,7 @@ def render_whale_panel():
     st.divider()
     st.markdown("### Manual Controls")
     if st.button("Run Whale Scan Now", type="primary"):
-        with st.spinner("Scanning top 30 symbols for whale activity..."):
+        with st.spinner(f"Scanning top {settings.WHALE_SCAN_TOP_N} symbols for whale activity..."):
             try:
                 import pymongo as _pm
                 from ai.whale_tracker import run_whale_scan

@@ -69,12 +69,14 @@ def calculate_final_score(profit_data: Dict, news_data: Dict,
         final_score = round(min(100, max(0, whale_adj_score * regime_mult)), 2)
 
         # Signal thresholds — calibrated for BEAR/SIDEWAYS regime reality
-        # BUY: 65+ (was 75 — too high, BEAR×0.80 made it unreachable)
-        # HOLD: 40-65 (was 45)
-        # SELL: <40 (was <45)
-        if final_score >= 65:
+        # BEAR regime applies ×0.80 which reduces scores significantly.
+        # Example: tech=72 base=71 → after BEAR×0.80 = 57 → must be BUY
+        # BUY  >= 55  (was 75, then 65 — both too high for BEAR regime)
+        # HOLD >= 35  (covers mid-range coins)
+        # SELL  < 35
+        if final_score >= 55:
             signal = "BUY"
-        elif final_score >= 40:
+        elif final_score >= 35:
             signal = "HOLD"
         else:
             signal = "SELL"

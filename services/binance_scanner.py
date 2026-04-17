@@ -1,5 +1,9 @@
 """
 Binance Scanner — fetches top 90 USDT pairs and klines with incremental support
+
+v2: Symbol list is now CACHED for 6 hours so the same 90 coins are scanned
+    consistently every 15-minute cycle, building gap-free signal history.
+    The list still refreshes every 6h to pick up new breakout coins.
 """
 
 import requests
@@ -15,9 +19,34 @@ BINANCE_API = "https://api.binance.com"
 
 EXCLUDED_TOKENS = ['UP', 'DOWN', 'BULL', 'BEAR']
 
+# ── Symbol list cache (refreshes every 6 hours) ───────────────────────────────
+_SYMBOL_CACHE_TTL   = 6 * 3600   # 6 hours in seconds
+_symbol_cache: List[str] = []
+_symbol_cache_ts: float  = 0.0   # Unix timestamp of last fetch
+
 
 def get_top_symbols(limit: int = 90) -> List[str]:
-    """Fetch top USDT pairs by 24h quote volume"""
+    """
+    Fetch top USDT pairs by 24h quote volume — cached for 6 hours.
+
+    The same 90 coins are returned every scan within a 6-hour window,
+    giving consistent, gap-free signal history. The list refreshes
+    every 6 hours to capture newly hot / breakout coins.
+    """
+    global _symbol_cache, _symbol_cache_ts
+
+    now = _time.time()
+    cache_age = now - _symbol_cache_ts
+
+    # Return cached list if still fresh
+    if _symbol_cache and cache_age < _SYMBOL_CACHE_TTL:
+        logger.debug(
+            f"[Scanner] Using cached symbol list ({len(_symbol_cache)} coins, "
+            f"refreshes in {int((_SYMBOL_CACHE_TTL - cache_age) / 60)} min)"
+        )
+        return _symbol_cache
+
+    # Cache expired or empty — fetch fresh from Binance
     try:
         resp = requests.get(f"{BINANCE_API}/api/v3/ticker/24hr", timeout=10)
         resp.raise_for_status()
@@ -26,13 +55,30 @@ def get_top_symbols(limit: int = 90) -> List[str]:
             t for t in resp.json()
             if t['symbol'].endswith('USDT')
             and not any(x in t['symbol'] for x in EXCLUDED_TOKENS)
+            and float(t.get('quoteVolume', 0)) > 0   # exclude dead/zero-volume pairs
         ]
+
+        # Sort by 24h quote volume (USD traded) — most liquid first
         pairs.sort(key=lambda x: float(x['quoteVolume']), reverse=True)
         symbols = [t['symbol'] for t in pairs[:limit]]
-        logger.info(f"Fetched top {len(symbols)} USDT pairs")
+
+        # Update cache
+        _symbol_cache    = symbols
+        _symbol_cache_ts = now
+
+        age_h = round(cache_age / 3600, 1)
+        logger.info(
+            f"[Scanner] Symbol list refreshed — {len(symbols)} coins "
+            f"(previous list was {age_h}h old). Next refresh in 6h."
+        )
         return symbols
+
     except Exception as e:
-        logger.error(f"Error fetching top symbols: {e}")
+        logger.error(f"[Scanner] Error fetching top symbols: {e}")
+        # Return stale cache if available rather than empty list
+        if _symbol_cache:
+            logger.warning(f"[Scanner] Returning stale cache ({len(_symbol_cache)} symbols)")
+            return _symbol_cache
         return []
 
 

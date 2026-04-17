@@ -471,12 +471,12 @@ def main():
     scheduler.add_job(cleanup_old_data, trigger=IntervalTrigger(hours=24),
                       id='cleanup', name='Data Cleanup', replace_existing=True)
 
-    # Once per week: self-learning cycle (weight adaptation)
-    scheduler.add_job(run_learning, trigger=IntervalTrigger(weeks=1),
+    # Every 3 days: self-learning cycle (was 7 days — shortened for faster adaptation with fresh data)
+    scheduler.add_job(run_learning, trigger=IntervalTrigger(days=3),
                       id='learning', name='Self-Learning AI', replace_existing=True)
 
-    # Once per week: strategy parameter optimization
-    scheduler.add_job(run_optimization_job, trigger=IntervalTrigger(weeks=1),
+    # Every 3 days: strategy parameter optimization (was 7 days — needs only 2-3 days of signals)
+    scheduler.add_job(run_optimization_job, trigger=IntervalTrigger(days=3),
                       id='optimization', name='Strategy Optimizer', replace_existing=True)
 
     # Once per day: RL reinforcement learning cycle
@@ -496,8 +496,8 @@ def main():
     logger.info("  - Regime snapshot:     every 1 hour")
     logger.info("  - Data cleanup:        every 24 hours")
     logger.info("  - RL Learning:         every 24 hours")
-    logger.info("  - Self-Learning:       every 7 days")
-    logger.info("  - Strategy Optimizer:  every 7 days")
+    logger.info("  - Self-Learning:       every 3 days")
+    logger.info("  - Strategy Optimizer:  every 3 days")
     logger.info("  Press Ctrl+C to stop.")
 
     try:

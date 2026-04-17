@@ -265,6 +265,7 @@ class MongoDBClient:
         if self.db is None:
             return []
         try:
+            # idx_signal_lookup index handles sort without RAM limit
             pipeline = [
                 {'$sort': {'timestamp': -1}},
                 {'$group': {

@@ -586,9 +586,10 @@ def rank_coins(scan_results: List[Dict]) -> List[Dict]:
     # Sort descending by final rank_score
     ranked.sort(key=lambda x: x['rank_score'], reverse=True)
 
-    # Assign rank position
+    # Assign rank position and top_rank (top 3 get 1/2/3, rest get None)
     for i, r in enumerate(ranked, 1):
         r['rank'] = i
+        r['top_rank'] = i if i <= 3 else None
 
     logger.info(
         f"[Ranking] {len(scan_results)} coins scanned → {len(ranked)} qualified "
@@ -719,6 +720,7 @@ def run_ranking_from_db(db) -> List[Dict]:
     Used when ranking needs to run independently of live scan.
     """
     try:
+        # idx_signal_lookup index handles sort without RAM limit
         pipeline = [
             {'$sort': {'timestamp': -1}},
             {'$group': {'_id': '$symbol', 'doc': {'$first': '$$ROOT'}}},
