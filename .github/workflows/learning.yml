@@ -1,0 +1,29 @@
+name: 🎓 AI Learning (Every 3 Days)
+
+on:
+  schedule:
+    - cron: '0 3 */3 * *'     # Every 3 days at 3:00 AM UTC (8:30 AM IST)
+  workflow_dispatch:
+
+jobs:
+  learning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60        # Learning can take up to 20 min — give plenty of time
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run AI Learning + Strategy Optimization
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+        run: python github_jobs/learning_job.py

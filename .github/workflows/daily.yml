@@ -1,0 +1,29 @@
+name: 🧠 Daily AI Jobs (Every 24h)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'       # Every day at 2:00 AM UTC (7:30 AM IST)
+  workflow_dispatch:
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Daily Jobs (Regime + RL + Cleanup)
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+        run: python github_jobs/daily_job.py

@@ -1,0 +1,29 @@
+name: 📡 Market Scan (Every 15 min)
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # Every 15 minutes, 24/7
+  workflow_dispatch:           # Also allow manual trigger from GitHub UI
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12        # Kill job if it hangs beyond 12 min
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'         # Cache pip packages — saves ~2 min per run
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Market Scan
+        env:
+          MONGO_URI: ${{ secrets.MONGO_URI }}
+        run: python github_jobs/scan_job.py

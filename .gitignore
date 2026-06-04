@@ -97,3 +97,9 @@ optimization_results.json
 # ── OS ───────────────────────────────────────────────────────
 desktop.ini
 .DS_Store
+
+
+node_modules/
+.env
+dist/
+build/
