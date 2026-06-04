@@ -2,14 +2,10 @@
 GitHub Actions — Market Scan Job
 Runs every 15 minutes via .github/workflows/scan.yml
 
-What it does (same as scheduler, but single-shot):
-  1. Full market scan (90 coins) → AI signals → save to MongoDB
-  2. Ranking engine → update ranked_opportunities
-  3. Whale intelligence scan (60 symbols)
-  4. Conviction picks update
-  5. Paper trading check
+Uses importlib to load scheduler.py directly by path,
+bypassing the scheduler/ folder (package naming conflict).
 """
-import os, sys, logging
+import os, sys, logging, importlib.util
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,8 +20,17 @@ log.info("=" * 60)
 log.info("GITHUB ACTIONS: Market Scan Job starting...")
 log.info("=" * 60)
 
-# Import after path is set — settings.py will read MONGO_URI from env
-from scheduler import run_scan, run_whale_scan_job, run_conviction_update
+# ── Load scheduler.py directly (avoids scheduler/ folder conflict) ───────────
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("scheduler_main",
+                                                os.path.join(_root, "scheduler.py"))
+_sched = importlib.util.module_from_spec(_spec)
+sys.modules["scheduler_main"] = _sched
+_spec.loader.exec_module(_sched)
+
+run_scan            = _sched.run_scan
+run_whale_scan_job  = _sched.run_whale_scan_job
+run_conviction_update = _sched.run_conviction_update
 
 # ── Run all scan-cycle tasks ─────────────────────────────────────────────────
 try:

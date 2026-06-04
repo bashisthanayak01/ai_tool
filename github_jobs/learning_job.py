@@ -1,12 +1,8 @@
 """
 GitHub Actions — Learning Job
 Runs every 3 days via .github/workflows/learning.yml
-
-What it does:
-  1. AI self-learning cycle (analyse trades, adjust model weights)
-  2. Strategy optimization (grid search best TP/SL/score parameters)
 """
-import os, sys, logging
+import os, sys, logging, importlib.util
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,7 +16,16 @@ log.info("=" * 60)
 log.info("GITHUB ACTIONS: Learning Job starting...")
 log.info("=" * 60)
 
-from scheduler import run_learning, run_optimization_job
+# Load scheduler.py directly (avoids scheduler/ folder conflict)
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("scheduler_main",
+                                                os.path.join(_root, "scheduler.py"))
+_sched = importlib.util.module_from_spec(_spec)
+sys.modules["scheduler_main"] = _sched
+_spec.loader.exec_module(_sched)
+
+run_learning         = _sched.run_learning
+run_optimization_job = _sched.run_optimization_job
 
 try:
     log.info("[1/2] Running AI self-learning cycle...")

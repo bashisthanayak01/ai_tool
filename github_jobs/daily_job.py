@@ -1,13 +1,8 @@
 """
 GitHub Actions — Daily Job
 Runs every 24 hours via .github/workflows/daily.yml
-
-What it does:
-  1. Market regime snapshot (BTC trend detection)
-  2. RL reinforcement learning parameter update
-  3. Data cleanup (remove signals > 100 days old)
 """
-import os, sys, logging
+import os, sys, logging, importlib.util
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,7 +16,17 @@ log.info("=" * 60)
 log.info("GITHUB ACTIONS: Daily Job starting...")
 log.info("=" * 60)
 
-from scheduler import save_regime_snapshot, run_rl_learning_job, cleanup_old_data
+# Load scheduler.py directly (avoids scheduler/ folder conflict)
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_spec = importlib.util.spec_from_file_location("scheduler_main",
+                                                os.path.join(_root, "scheduler.py"))
+_sched = importlib.util.module_from_spec(_spec)
+sys.modules["scheduler_main"] = _sched
+_spec.loader.exec_module(_sched)
+
+save_regime_snapshot = _sched.save_regime_snapshot
+run_rl_learning_job  = _sched.run_rl_learning_job
+cleanup_old_data     = _sched.cleanup_old_data
 
 try:
     log.info("[1/3] Saving market regime snapshot...")
@@ -38,7 +43,7 @@ except Exception as e:
     log.error(f"[2/3] RL error: {e}")
 
 try:
-    log.info("[3/3] Running data cleanup (keep 100 days)...")
+    log.info("[3/3] Running data cleanup...")
     cleanup_old_data()
     log.info("[3/3] Cleanup done.")
 except Exception as e:
