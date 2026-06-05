@@ -590,7 +590,7 @@ def render_live_analytics():
         if 'Risk Level' in display.columns: styled = styled.map(color_risk_level, subset=['Risk Level'])
         if 'Whale'      in display.columns: styled = styled.map(color_whale,      subset=['Whale'])
 
-        st.dataframe(styled, width='stretch', height=600)
+        st.dataframe(styled, use_container_width=True, height=600)
 
     # ─── CHARTS ROW ───
     if not fdf.empty and 'final_score' in fdf.columns:
@@ -1094,7 +1094,7 @@ def render_top_opportunities():
     if 'Signal'     in tdf.columns: styled = styled.map(_c_signal, subset=['Signal'])
     if 'Rank Score' in tdf.columns: styled = styled.map(_c_score,  subset=['Rank Score'])
     if 'News'       in tdf.columns: styled = styled.map(_c_news,   subset=['News'])
-    st.dataframe(styled, width='stretch', height=420)
+    st.dataframe(styled, use_container_width=True, height=420)
 
     st.markdown("---")
 
@@ -1375,7 +1375,7 @@ def render_backtesting():
             eq_df = eq_df.set_index('timestamp')
             if len(eq_df) > 200:
                 eq_df = eq_df.iloc[::max(1, len(eq_df)//200)]
-            st.line_chart(eq_df['equity'], width='stretch')
+            st.line_chart(eq_df['equity'], use_container_width=True)
 
     st.markdown("---")
 
@@ -1411,7 +1411,7 @@ def render_backtesting():
         if 'Profit ($)' in tdf_display.columns:
             styled = styled.map(color_pnl, subset=['Profit ($)'])
 
-        st.dataframe(styled, width='stretch', height=400)
+        st.dataframe(styled, use_container_width=True, height=400)
 
         if 'exit_reason' in tdf.columns:
             st.subheader("📊 Exit Reasons")
@@ -1487,7 +1487,7 @@ def render_ai_learning():
             wdf_rows.append({'Indicator': k.title(), 'Weight': round(v, 4),
                              'Weight %': f"{v*100:.1f}%", 'Win Rate': wr_s})
         wdf = pd.DataFrame(wdf_rows).sort_values('Weight', ascending=False)
-        st.dataframe(wdf, width='stretch', hide_index=True)
+        st.dataframe(wdf, use_container_width=True, hide_index=True)
 
         # Weight bar chart
         wdf_chart = pd.DataFrame({'Weight': weights}, index=weights.keys())
@@ -1557,7 +1557,7 @@ def render_ai_learning():
             row.update({k.title(): round(v, 4) for k, v in (doc.get('weights') or {}).items()})
             rows.append(row)
         hist_df = pd.DataFrame(rows)
-        st.dataframe(hist_df, width='stretch', hide_index=True)
+        st.dataframe(hist_df, use_container_width=True, hide_index=True)
     else:
         st.info("No weight history yet — run at least one learning cycle.")
 
@@ -1693,7 +1693,7 @@ def render_rl_panel():
                     margin=dict(l=0, r=0, t=10, b=0),
                     legend=dict(x=0, y=1)
                 )
-                st.plotly_chart(fig, width='stretch')
+                st.plotly_chart(fig, use_container_width=True)
             except Exception:
                 pass
 
@@ -1710,7 +1710,7 @@ def render_rl_panel():
                 'Improvement': f"{h.get('improvement_pct', 0):+.1f}%",
                 'Applied':   'YES' if h.get('applied') else 'NO',
             })
-        st.dataframe(pd.DataFrame(rows), width='stretch')
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
         st.info("No RL performance history yet. Run the comparison below.")
 
@@ -1824,7 +1824,7 @@ def render_strategy_intelligence():
                 'Take Profit %':  f"{cfg_item.get('take_profit_pct', 0):.1f}%",
                 'Active':         '✅' if cfg_item.get('is_active') else '—',
             })
-        st.dataframe(pd.DataFrame(rows), width='stretch')
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     # ── Optimisation log ──
     if opt_log:
@@ -1840,7 +1840,7 @@ def render_strategy_intelligence():
                 'Return %':      f"{entry.get('return_pct', 0):+.1f}%",
                 'Profit Factor': f"{entry.get('profit_factor', 0):.2f}",
             })
-        st.dataframe(pd.DataFrame(log_rows), width='stretch')
+        st.dataframe(pd.DataFrame(log_rows), use_container_width=True)
     else:
         st.info("No optimisation runs yet — runs once per week.")
 
@@ -2108,7 +2108,7 @@ def render_whale_panel():
 
     if rows:
         df = pd.DataFrame(rows)
-        st.dataframe(df, width='stretch', height=400)
+        st.dataframe(df, use_container_width=True, height=400)
 
     # ── Buy vs Sell pressure bars (top 10) ──
     st.divider()
@@ -2134,7 +2134,7 @@ def render_whale_panel():
             font=dict(color='white'), margin=dict(l=0, r=0, t=10, b=0),
             legend=dict(x=0, y=1)
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     except Exception:
         pass
 
@@ -2159,7 +2159,7 @@ def render_whale_panel():
             plot_bgcolor='#0e1117', paper_bgcolor='#0e1117',
             font=dict(color='white'), margin=dict(l=0, r=0, t=10, b=0)
         )
-        st.plotly_chart(fig2, width='stretch')
+        st.plotly_chart(fig2, use_container_width=True)
     except Exception:
         pass
 
