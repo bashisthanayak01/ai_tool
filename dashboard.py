@@ -1947,7 +1947,7 @@ def render_paper_trading_panel():
                 'R:R': f"{float(_rr):.1f}" if _rr else '-',
                 'Opened (IST)': t.get('opened_ist', '?'),
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
     # ── Recent closed trades ──
     closed = summary.get('closed_trades', [])
@@ -1969,7 +1969,7 @@ def render_paper_trading_panel():
         def highlight_outcome(row):
             color = '#1a4d2e' if row['Outcome'] == 'WIN' else '#4d1a1a' if row['Outcome'] == 'LOSS' else '#333'
             return [f'background-color: {color}'] * len(row)
-        st.dataframe(df2.style.apply(highlight_outcome, axis=1), width="stretch")
+        st.dataframe(df2.style.apply(highlight_outcome, axis=1), use_container_width=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2035,7 +2035,7 @@ def render_scan_time_panel():
         font=dict(color='white'), margin=dict(l=0, r=0, t=20, b=0),
         legend=dict(bgcolor='rgba(0,0,0,0)')
     )
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
     st.caption(f"Analysis based on {data.get('signals_analysed', 0)} BUY signals over last 2 days.")
 
 
