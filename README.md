@@ -3,11 +3,10 @@ title: Crypto AI Dashboard
 emoji: 📊
 colorFrom: blue
 colorTo: purple
-sdk: streamlit
-sdk_version: 1.31.0
-app_file: dashboard.py
+sdk: docker
 pinned: false
 license: mit
+app_port: 7860
 ---
 
 # Crypto AI Trading Signal Dashboard
