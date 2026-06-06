@@ -1,28 +1,25 @@
-name: 📡 Market Scan (Every 15 min)
+name: 📡 Market Scan (DISABLED - Binance blocks US IPs)
+# Binance API returns 451 Geographic Restriction from GitHub Actions US servers.
+# Run scheduler.py on your local laptop instead (India IP not blocked).
+# This workflow is disabled — manual trigger only for testing.
 
 on:
-  schedule:
-    - cron: '*/15 * * * *'   # Every 15 minutes, 24/7
-  workflow_dispatch:           # Also allow manual trigger from GitHub UI
+  workflow_dispatch:   # Only manual trigger — NOT on schedule
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 12        # Kill job if it hangs beyond 12 min
-
+    timeout-minutes: 12
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'         # Cache pip packages — saves ~2 min per run
-
+          cache: 'pip'
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run Market Scan
         env:
           MONGO_URI: ${{ secrets.MONGO_URI }}
