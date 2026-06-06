@@ -160,52 +160,45 @@ def _get_per_coin_threshold(symbol: str, db=None) -> float:
 # 1. AGG TRADES — Detect large buy/sell trades
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_agg_trades(symbol: str) -> Dict:
+def _fetch_agg_trades(symbol: str, market: Dict = None) -> Dict:
     """
-    Fetch last N aggTrades.
-    Returns buy_volume, sell_volume, large_trade_count, large_trade_ratio,
-    whale_buy_pressure, whale_sell_pressure.
+    CoinGecko-based volume flow analysis (replaces Binance aggTrades).
+    Uses 24h price momentum + range position to detect buy/sell pressure.
+    Same return format as original for backward compatibility.
     """
     empty = {
         'buy_volume': 0, 'sell_volume': 0,
         'large_trade_count': 0, 'large_trade_ratio': 0.0,
-        'whale_buy_pressure': 0.0, 'whale_sell_pressure': 0.0,
+        'whale_buy_pressure': 0.5, 'whale_sell_pressure': 0.5,
         'agg_score': 50.0,
     }
     try:
-        data = _get(f"{BINANCE_API}/api/v3/aggTrades",
-                    {'symbol': symbol, 'limit': AGG_TRADES_LIMIT})
-        if not data:
+        m = market or _cg_cache.get(symbol, {})
+        if not m:
             return empty
 
-        volume    = m.get('volume', 0)
-        change_24h = m.get('change_24h', 0)   # % price change
+        volume     = m.get('volume', 0)
+        change_24h = m.get('change_24h', 0)
         change_1h  = m.get('change_1h', 0)
         high_24h   = m.get('high_24h', 0)
         low_24h    = m.get('low_24h', 0)
         price      = m.get('price', 0)
 
-        # Volume spike: compare to 7-day average via DB
-        vol_ratio = 1.0
-        large_trade_ratio = 0.0
-
-        # Directional bias: positive change_24h = buying pressure
-        # Combine 1h and 24h momentum
+        # Directional bias: combine 1h and 24h momentum
         momentum = (change_1h * 0.6 + change_24h * 0.4) / 100.0
         momentum = max(-1.0, min(1.0, momentum))
 
-        # Buy/sell pressure from price direction + range position
+        # Price position in 24h range
         price_range = high_24h - low_24h
-        if price_range > 0 and price > 0:
-            range_pos = (price - low_24h) / price_range  # 0=near low, 1=near high
-        else:
-            range_pos = 0.5
+        range_pos = ((price - low_24h) / price_range
+                     if price_range > 0 and price > 0 else 0.5)
 
-        # Combine momentum and range position for buy pressure
-        whale_buy_pressure  = max(0.0, min(1.0, 0.4 * (momentum + 1) / 2 + 0.6 * range_pos))
+        # Buy pressure from momentum + range position
+        whale_buy_pressure  = max(0.0, min(1.0,
+            0.4 * (momentum + 1) / 2 + 0.6 * range_pos))
         whale_sell_pressure = 1.0 - whale_buy_pressure
 
-        # Volume significance: high volume + strong direction = whale signal
+        # Volume significance: strong momentum = large effective trade
         large_trade_ratio = min(1.0, abs(momentum) * 2)
         if large_trade_ratio >= 0.02:
             agg_score = 50.0 + (whale_buy_pressure - 0.5) * 100.0
@@ -215,18 +208,20 @@ def _fetch_agg_trades(symbol: str) -> Dict:
         agg_score = max(0.0, min(100.0, agg_score))
 
         return {
-            'buy_volume':         round(volume * whale_buy_pressure, 0),
-            'sell_volume':        round(volume * whale_sell_pressure, 0),
-            'large_trade_count':  int(large_trade_ratio * 10),
-            'large_trade_ratio':  round(large_trade_ratio, 4),
-            'whale_buy_pressure': round(whale_buy_pressure, 4),
+            'buy_volume':          round(volume * whale_buy_pressure, 0),
+            'sell_volume':         round(volume * whale_sell_pressure, 0),
+            'large_trade_count':   int(large_trade_ratio * 10),
+            'large_trade_ratio':   round(large_trade_ratio, 4),
+            'whale_buy_pressure':  round(whale_buy_pressure, 4),
             'whale_sell_pressure': round(whale_sell_pressure, 4),
-            'agg_score':          round(agg_score, 2),
+            'agg_score':           round(agg_score, 2),
         }
 
     except Exception as e:
         logger.debug(f"[Whale/volumeFlow] {symbol}: {e}")
         return empty
+
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
