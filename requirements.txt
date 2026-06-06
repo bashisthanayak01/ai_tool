@@ -10,3 +10,4 @@ scikit-learn==1.4.0
 python-dotenv==1.0.0
 feedparser==6.0.11
 schedule==1.2.1
+plotly>=5.18.0
