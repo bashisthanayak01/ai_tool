@@ -34,7 +34,8 @@ _scan_count = 0
 # ── Health check HTTP server ─────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     """Simple health check — UptimeRobot pings this to keep HF Space awake."""
-    def do_GET(self):
+
+    def _send_ok(self, include_body=True):
         uptime = datetime.utcnow() - _start_time
         hours = int(uptime.total_seconds() // 3600)
         mins  = int((uptime.total_seconds() % 3600) // 60)
@@ -43,13 +44,21 @@ class HealthHandler(BaseHTTPRequestHandler):
             f"Uptime: {hours}h {mins}m\n"
             f"Started: {_start_time.strftime('%Y-%m-%d %H:%M UTC')}\n"
             f"Server: Hugging Face (EU - France)\n"
-            f"Binance: Accessible (not blocked)\n"
+            f"Data: CoinGecko + Yahoo Finance (no geo-blocks)\n"
         ).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/plain')
         self.send_header('Content-Length', len(body))
         self.end_headers()
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._send_ok(include_body=True)
+
+    def do_HEAD(self):
+        # UptimeRobot sends HEAD requests — must return 200 or it shows "Down"
+        self._send_ok(include_body=False)
 
     def log_message(self, format, *args):
         pass  # Suppress HTTP access logs to keep logs clean

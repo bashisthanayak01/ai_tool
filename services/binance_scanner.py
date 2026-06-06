@@ -86,8 +86,8 @@ def _interval_to_yf(interval: str) -> tuple:
 
 def _symbol_to_yf(symbol: str) -> str:
     """Convert 'BTCUSDT' → 'BTC-USD' for Yahoo Finance."""
-    # Remove USDT suffix and add -USD
-    base = symbol.replace('USDT', '').replace('BUSD', '').replace('BTC', 'BTC')
+    base = symbol.replace('USDT', '').replace('BUSD', '')
+
     return f"{base}-USD"
 
 
