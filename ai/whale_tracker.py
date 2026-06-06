@@ -32,7 +32,12 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # ── Binance endpoints ────────────────────────────────────────────────────────
+# NOTE: Binance API is geo-blocked from cloud servers (451 error).
+# Whale tracker using Binance-specific endpoints (aggTrades, depth) will return
+# empty/neutral results when run from HF Spaces. The main scan still works via CoinGecko.
+# Whale detection will be active when running locally (residential IP, not blocked).
 BINANCE_API = "https://api.binance.com"
+
 
 # ── Thresholds & weights ─────────────────────────────────────────────────────
 LARGE_TRADE_USDT      = 50_000      # fallback threshold (per-coin Z-score used if history available)

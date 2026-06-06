@@ -688,15 +688,33 @@ def render_top_opportunities():
         else:
             st.success(f"✅ Data is fresh — scanned {int(data_age_min)} min ago", icon="✅")
 
-    # ── Pre-fetch live prices from Binance (cached 15s) ─────────────────────
+    # ── Pre-fetch live prices from CoinGecko (cached, no geo-restrictions) ────
     top_syms = rdf['symbol'].head(10).tolist() if 'symbol' in rdf.columns else []
     live_prices = {}
     try:
         import requests as _req
-        _resp = _req.get("https://api.binance.com/api/v3/ticker/price", timeout=5)
+        # Use CoinGecko simple/price — works from any server (no Binance geo-block)
+        _ids_map = {}
+        for _s in top_syms:
+            _coin = _s.replace('USDT','').lower()
+            # common CoinGecko ID overrides
+            _overrides = {'btc':'bitcoin','eth':'ethereum','sol':'solana',
+                         'xrp':'ripple','bnb':'binancecoin','ada':'cardano',
+                         'doge':'dogecoin','dot':'polkadot','matic':'matic-network',
+                         'link':'chainlink','ltc':'litecoin','avax':'avalanche-2',
+                         'atom':'cosmos','uni':'uniswap','trx':'tron'}
+            _ids_map[_s] = _overrides.get(_coin, _coin)
+        _ids_str = ','.join(set(_ids_map.values()))
+        _resp = _req.get(
+            'https://api.coingecko.com/api/v3/simple/price',
+            params={'ids': _ids_str, 'vs_currencies': 'usd'},
+            timeout=8
+        )
         if _resp.status_code == 200:
-            _all = {item['symbol']: float(item['price']) for item in _resp.json()}
-            live_prices = {s: _all[s] for s in top_syms if s in _all}
+            _cg = _resp.json()
+            for _s, _cid in _ids_map.items():
+                if _cid in _cg and 'usd' in _cg[_cid]:
+                    live_prices[_s] = float(_cg[_cid]['usd'])
     except Exception:
         pass  # fall back to stored prices gracefully
 
