@@ -1,37 +1,33 @@
 """
-Market Scanner — CoinGecko Edition
-Replaces Binance API (blocked from cloud servers) with CoinGecko API.
+Market Scanner v3 — Hybrid CoinGecko + Yahoo Finance
+=====================================================
 
-CoinGecko advantages:
-  - Works from ANY server (GitHub Actions, HF Spaces, any cloud)
-  - No geographic restrictions
-  - Free tier: no API key needed
-  - Reliable uptime
+Data sources (both work from ANY cloud server):
+  - CoinGecko /coins/markets : top coins list + current price/volume (1 API call)
+  - Yahoo Finance (yfinance)  : OHLCV historical data (no rate limits, unlimited)
 
-Function signatures are IDENTICAL to the old Binance version,
-so no other file needs to change.
+Why this combo:
+  - CoinGecko OHLCV endpoint has very strict rate limits (~4 calls/min free)
+    → 90 coins would require 22+ minutes with delays
+  - Yahoo Finance has no documented rate limit and supports batch downloads
+    → 90 coins in ~10 seconds
 
-Interval mapping (Binance → CoinGecko days):
-  1m, 5m     → 1 day  (30-min candles)
-  15m, 30m   → 7 days (4-hour candles)
-  1h, 2h     → 14 days (4-hour candles)
-  4h         → 30 days (daily candles)
-  1d, 3d, 1w → 90 days (daily candles)
+Function signatures are IDENTICAL to the old Binance version.
+No other file needs to change.
 """
 
 import requests
 import logging
 import time as _time
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-COINGECKO_API  = "https://api.coingecko.com/api/v3"
-REQUEST_DELAY  = 3.5   # seconds between calls (~17 calls/min, well under 30/min limit)
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 
-# Stablecoins to exclude from scan
+# Stablecoins to exclude
 _STABLES = {'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'FRAX', 'GUSD',
              'USDD', 'LUSD', 'SUSD', 'CUSD', 'ALUSD', 'FDUSD', 'PYUSD'}
 
@@ -40,21 +36,23 @@ _symbol_cache: List[str] = []
 _symbol_cache_ts: float  = 0.0
 _SYMBOL_CACHE_TTL        = 6 * 3600   # 6 hours
 
-_id_map:      Dict[str, str]  = {}   # "BTCUSDT"  → "bitcoin"
-_market_data: Dict[str, Dict] = {}   # "BTCUSDT"  → {price, volume, change…}
+_id_map:      Dict[str, str]  = {}    # "BTCUSDT" → "bitcoin"
+_market_data: Dict[str, Dict] = {}    # "BTCUSDT" → {price, volume, change…}
+
+_ohlcv_cache: Dict[str, Dict] = {}    # "BTCUSDT|1d" → {data, ts}
+_OHLCV_CACHE_TTL = 60 * 60            # 60 minutes (daily candles barely change)
 
 
-# ── Low-level HTTP helper ─────────────────────────────────────────────────────
+# ── CoinGecko helper ──────────────────────────────────────────────────────────
 def _cg_get(endpoint: str, params: dict = None, retries: int = 3) -> Optional[any]:
-    """Rate-limited GET request to CoinGecko. Handles 429 automatically."""
+    """Rate-limited GET to CoinGecko. Handles 429 automatically."""
     url = f"{COINGECKO_API}{endpoint}"
     for attempt in range(retries):
         try:
             resp = requests.get(url, params=params or {}, timeout=30)
             if resp.status_code == 429:
-                wait = 65
-                logger.warning(f"CoinGecko rate-limited — waiting {wait}s…")
-                _time.sleep(wait)
+                logger.warning("CoinGecko rate-limited — waiting 65s…")
+                _time.sleep(65)
                 continue
             resp.raise_for_status()
             return resp.json()
@@ -65,25 +63,141 @@ def _cg_get(endpoint: str, params: dict = None, retries: int = 3) -> Optional[an
     return None
 
 
-def _interval_to_days(interval: str) -> int:
-    """Map Binance-style interval string to CoinGecko days parameter."""
+# ── Yahoo Finance OHLCV ───────────────────────────────────────────────────────
+def _interval_to_yf(interval: str) -> tuple:
+    """
+    Map Binance interval to (yfinance_interval, yfinance_period).
+    Returns (yf_interval, yf_period) suitable for yf.download().
+    """
     mapping = {
-        '1m': 1,  '3m': 1,  '5m': 1,
-        '15m': 7, '30m': 7,
-        '1h': 14, '2h': 14,
-        '4h': 30,
-        '6h': 30, '8h': 30, '12h': 30,
-        '1d': 90, '3d': 90, '1w': 365,
+        '1m':  ('1m',  '7d'),
+        '5m':  ('5m',  '60d'),
+        '15m': ('15m', '60d'),
+        '30m': ('30m', '60d'),
+        '1h':  ('1h',  '730d'),
+        '2h':  ('1h',  '730d'),   # yf has no 2h; use 1h
+        '4h':  ('1h',  '730d'),   # yf has no 4h; use 1h
+        '1d':  ('1d',  '730d'),
+        '3d':  ('1d',  '730d'),
+        '1w':  ('1wk', '730d'),
     }
-    return mapping.get(interval, 90)
+    return mapping.get(interval, ('1d', '730d'))
+
+
+def _symbol_to_yf(symbol: str) -> str:
+    """Convert 'BTCUSDT' → 'BTC-USD' for Yahoo Finance."""
+    # Remove USDT suffix and add -USD
+    base = symbol.replace('USDT', '').replace('BUSD', '').replace('BTC', 'BTC')
+    return f"{base}-USD"
+
+
+def _fetch_yf_batch(symbols: List[str], interval: str = '1d',
+                    limit: int = 200) -> Dict[str, List[Dict]]:
+    """
+    Batch-download OHLCV for multiple symbols from Yahoo Finance.
+    Handles yfinance's MultiIndex column format (new in 0.2.x).
+    Returns {symbol: [kline_dicts]}
+    """
+    try:
+        import yfinance as yf
+        import pandas as pd
+    except ImportError:
+        logger.error("[YF] yfinance not installed — run: pip install yfinance")
+        return {}
+
+    yf_interval, yf_period = _interval_to_yf(interval)
+    yf_tickers = [_symbol_to_yf(s) for s in symbols]
+    yf_map = {_symbol_to_yf(s): s for s in symbols}  # "BTC-USD" → "BTCUSDT"
+
+    try:
+        data = yf.download(
+            tickers=yf_tickers,
+            period=yf_period,
+            interval=yf_interval,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+
+        if data is None or data.empty:
+            logger.warning("[YF] Empty response from Yahoo Finance")
+            return {}
+
+        result = {}
+
+        for ticker in yf_tickers:
+            sym = yf_map.get(ticker)
+            if not sym:
+                continue
+            try:
+                # yfinance 0.2.x always uses MultiIndex columns: ('Close', 'BTC-USD')
+                # Extract per-ticker slice and flatten to simple column names
+                if isinstance(data.columns, pd.MultiIndex):
+                    # Multi-ticker download: data has ('Close','BTC-USD'), ('High','BTC-USD'), ...
+                    if ticker in data.columns.get_level_values(1):
+                        df = data.xs(ticker, axis=1, level=1).copy()
+                    else:
+                        logger.debug(f"[YF] Ticker {ticker} not in download result")
+                        continue
+                else:
+                    # Single ticker (shouldn't happen with new yfinance but handle anyway)
+                    df = data.copy()
+                    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+
+                if df is None or df.empty:
+                    continue
+
+                market = _market_data.get(sym, {})
+                vol = market.get('volume', 0)
+                klines = _parse_yf_df(df, sym, vol, limit)
+                if klines:
+                    result[sym] = klines
+                    logger.debug(f"[YF] {sym}: {len(klines)} candles, close={klines[-1]['close']:.4f}")
+
+            except Exception as e:
+                logger.debug(f"[YF] parse error for {sym}: {e}")
+
+        logger.info(f"[YF] Fetched OHLCV for {len(result)}/{len(symbols)} symbols")
+        return result
+
+    except Exception as e:
+        logger.error(f"[YF] Batch download error: {e}")
+        return {}
+
+
+def _parse_yf_df(df, symbol: str, volume_24h: float, limit: int) -> List[Dict]:
+    """Parse a yfinance DataFrame into our standard kline dict list."""
+    try:
+        rows = df.dropna(subset=['Close']).tail(limit)
+        klines = []
+        vol_per_candle = volume_24h / max(len(rows), 1)
+
+        for ts, row in rows.iterrows():
+            open_time = ts.to_pydatetime().replace(tzinfo=None)
+            klines.append({
+                'symbol':      symbol,
+                'open_time':   open_time,
+                'close_time':  open_time,
+                'open':        float(row.get('Open',  row.get('Close', 0))),
+                'high':        float(row.get('High',  row.get('Close', 0))),
+                'low':         float(row.get('Low',   row.get('Close', 0))),
+                'close':       float(row['Close']),
+                'volume':      float(row.get('Volume', vol_per_candle)),
+                'quote_volume': float(row.get('Volume', 0)),
+                'trades':      0,
+            })
+        return klines
+    except Exception as e:
+        logger.debug(f"[YF] DataFrame parse error ({symbol}): {e}")
+        return []
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 def get_top_symbols(limit: int = 90) -> List[str]:
     """
-    Fetch top coins by 24h volume — cached for 6 hours.
-    Returns Binance-style USDT pairs e.g. ['BTCUSDT', 'ETHUSDT', …]
-    ONE API call fetches all coin data at once (very efficient).
+    Fetch top coins by 24h volume from CoinGecko — cached 6 hours.
+    Returns Binance-style USDT pairs: ['BTCUSDT', 'ETHUSDT', …]
+    ONE API call fetches data for all coins at once.
     """
     global _symbol_cache, _symbol_cache_ts, _id_map, _market_data
 
@@ -94,7 +208,6 @@ def get_top_symbols(limit: int = 90) -> List[str]:
         return _symbol_cache
 
     try:
-        # Single call — returns top 250 coins with full market data
         data = _cg_get('/coins/markets', {
             'vs_currency': 'usd',
             'order': 'volume_desc',
@@ -151,69 +264,52 @@ def get_top_symbols(limit: int = 90) -> List[str]:
 
 def get_klines(symbol: str, interval: str = '1d', limit: int = 200) -> Optional[List[Dict]]:
     """
-    Fetch OHLC candles from CoinGecko.
-    Return format is IDENTICAL to the old Binance version so all
-    downstream code (indicators, AI engine) works unchanged.
+    Fetch OHLCV candles via Yahoo Finance (no rate limits, instant).
+    Uses 60-minute cache — candles are refetched only once per hour.
+    Return format identical to old Binance version.
     """
-    try:
-        # Make sure we have the CoinGecko ID for this symbol
-        if symbol not in _id_map:
-            get_top_symbols()
-        coin_id = _id_map.get(symbol)
-        if not coin_id:
-            logger.error(f"[Scanner] Unknown symbol {symbol} — not in CoinGecko map")
-            return None
+    cache_key = f"{symbol}|{interval}"
+    now = _time.time()
 
-        days = _interval_to_days(interval)
-        data = _cg_get(f'/coins/{coin_id}/ohlc', {'vs_currency': 'usd', 'days': days})
-
-        _time.sleep(REQUEST_DELAY)   # Respect rate limit
-
-        if not data:
-            return None
-
-        # CoinGecko OHLC format: [timestamp_ms, open, high, low, close]
-        market = _market_data.get(symbol, {})
-        volume = market.get('volume', 0)
-        vol_per_candle = volume / max(len(data), 1)
-
-        klines = []
-        for candle in data:
-            open_time = datetime.utcfromtimestamp(candle[0] / 1000)
-            klines.append({
-                'symbol':      symbol,
-                'open_time':   open_time,
-                'close_time':  open_time,
-                'open':        float(candle[1]),
-                'high':        float(candle[2]),
-                'low':         float(candle[3]),
-                'close':       float(candle[4]),
-                'volume':      vol_per_candle,
-                'quote_volume': volume,
-                'trades':      0,
-            })
-
-        # Take the most recent `limit` candles
-        klines = klines[-limit:]
-
-        # Override last candle close with live price so dashboard shows current price
-        live_price = market.get('price')
+    # ── OHLCV cache hit ────────────────────────────────────────────────────────
+    cached = _ohlcv_cache.get(cache_key)
+    if cached and (now - cached['ts']) < _OHLCV_CACHE_TTL:
+        klines = list(cached['data'])   # shallow copy
+        # Inject fresh live price into last candle (always up-to-date)
+        live_price = _market_data.get(symbol, {}).get('price')
         if klines and live_price:
+            klines[-1] = dict(klines[-1])  # copy before mutating
             klines[-1]['close'] = live_price
             klines[-1]['high']  = max(klines[-1]['high'], live_price)
             klines[-1]['low']   = min(klines[-1]['low'],  live_price)
+        return klines[-limit:] if len(klines) > limit else klines
 
-        return klines
+    # ── Fetch from Yahoo Finance ───────────────────────────────────────────────
+    batch = _fetch_yf_batch([symbol], interval, limit)
+    klines = batch.get(symbol)
 
-    except Exception as e:
-        logger.error(f"Error fetching klines for {symbol}: {e}")
+    if not klines:
+        logger.warning(f"[Scanner] No YF data for {symbol}, interval={interval}")
         return None
+
+    # Store clean data in cache (no live-price injection)
+    _ohlcv_cache[cache_key] = {'data': klines, 'ts': now}
+
+    # Trim to limit and inject live price
+    klines = klines[-limit:]
+    live_price = _market_data.get(symbol, {}).get('price')
+    if klines and live_price:
+        klines[-1] = dict(klines[-1])
+        klines[-1]['close'] = live_price
+        klines[-1]['high']  = max(klines[-1]['high'], live_price)
+        klines[-1]['low']   = min(klines[-1]['low'],  live_price)
+
+    return klines
 
 
 def get_klines_since(symbol: str, start_time: datetime, interval: str = '1d') -> List[Dict]:
     """
-    Fetch klines from start_time to now.
-    Used for incremental historical data collection.
+    Fetch klines from start_time to now (for incremental updates).
     """
     klines = get_klines(symbol, interval, limit=1000)
     if not klines:
@@ -222,28 +318,23 @@ def get_klines_since(symbol: str, start_time: datetime, interval: str = '1d') ->
 
 
 def _parse_kline(symbol: str, k: list) -> Dict:
-    """Parse a raw CoinGecko OHLC array into standard dict format."""
+    """Compatibility stub — not used in YF version."""
     ts = datetime.utcfromtimestamp(k[0] / 1000)
     return {
-        'symbol':      symbol,
-        'open_time':   ts,
-        'close_time':  ts,
-        'open':        float(k[1]),
-        'high':        float(k[2]),
-        'low':         float(k[3]),
-        'close':       float(k[4]),
-        'volume':      0,
-        'quote_volume': 0,
-        'trades':      0,
+        'symbol': symbol, 'open_time': ts, 'close_time': ts,
+        'open': float(k[1]), 'high': float(k[2]),
+        'low': float(k[3]), 'close': float(k[4]),
+        'volume': 0, 'quote_volume': 0, 'trades': 0,
     }
 
 
 if __name__ == "__main__":
-    print("Testing CoinGecko scanner...")
+    print("Testing hybrid CoinGecko + Yahoo Finance scanner...")
     symbols = get_top_symbols(5)
     print(f"Top 5: {symbols}")
     if symbols:
-        klines = get_klines(symbols[1], '1d', 10)
-        if klines:
-            print(f"Klines for {symbols[1]}: {len(klines)} candles")
-            print(f"Latest: open={klines[-1]['open']:.4f} close={klines[-1]['close']:.4f}")
+        k = get_klines(symbols[0], '1d', 10)
+        if k:
+            print(f"{symbols[0]}: {len(k)} candles, close={k[-1]['close']:.4f}")
+        k2 = get_klines(symbols[0], '1d', 10)  # should be instant (cache)
+        print(f"Cache hit: {len(k2)} candles (should be instant)")

@@ -2,7 +2,7 @@ pandas==2.1.4
 numpy==1.26.3
 pymongo==4.6.1
 requests==2.31.0
-python-binance==1.0.19
+yfinance>=0.2.40
 streamlit==1.31.0
 apscheduler==3.10.4
 ta==0.11.0
