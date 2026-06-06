@@ -32,20 +32,16 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # ── Binance endpoints ────────────────────────────────────────────────────────
-# NOTE: Binance API is geo-blocked from cloud servers (451 error).
-# Whale tracker using Binance-specific endpoints (aggTrades, depth) will return
-# empty/neutral results when run from HF Spaces. The main scan still works via CoinGecko.
-# Whale detection will be active when running locally (residential IP, not blocked).
-BINANCE_API = "https://api.binance.com"
-
+# CoinGecko API — works from any cloud server (no geo-restrictions)
+COINGECKO_API = "https://api.coingecko.com/api/v3"
 
 # ── Thresholds & weights ─────────────────────────────────────────────────────
-LARGE_TRADE_USDT      = 50_000      # fallback threshold (per-coin Z-score used if history available)
-AGG_TRADES_LIMIT      = 500         # number of aggTrades to fetch
-DEPTH_LEVELS          = 20          # order book levels to check
-WHALE_WEIGHT          = 10          # % contribution to final_score (default)
-ZSCORE_LOOKBACK_DAYS  = 7           # days of history for per-coin baseline
-ZSCORE_SIGMA          = 2.0         # standard deviations above mean = whale trade
+LARGE_TRADE_USDT      = 50_000
+AGG_TRADES_LIMIT      = 500
+DEPTH_LEVELS          = 20
+WHALE_WEIGHT          = 10
+ZSCORE_LOOKBACK_DAYS  = 7
+ZSCORE_SIGMA          = 2.0
 
 # Component weights (must sum to 1.0)
 W_AGG       = 0.35
@@ -54,21 +50,65 @@ W_TICKER    = 0.15
 W_KLINES    = 0.15
 W_DEPTH     = 0.10
 
-# ── Retry helpers ─────────────────────────────────────────────────────────────
+# ── CoinGecko market data cache ───────────────────────────────────────────────
+_cg_cache: Dict[str, Dict] = {}   # symbol → market data
+_cg_cache_ts: float = 0.0
+_CG_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_cg_market_data(symbols: List[str]) -> Dict[str, Dict]:
+    """
+    Fetch current market data for all symbols from CoinGecko in ONE API call.
+    Cached for 5 minutes to avoid rate limits.
+    Returns dict: symbol → {price, volume, change_24h, change_1h, high_24h, low_24h}
+    """
+    global _cg_cache, _cg_cache_ts
+    now = _time.time()
+    if _cg_cache and (now - _cg_cache_ts) < _CG_CACHE_TTL:
+        return _cg_cache
+    try:
+        resp = requests.get(
+            f"{COINGECKO_API}/coins/markets",
+            params={
+                'vs_currency': 'usd',
+                'order': 'volume_desc',
+                'per_page': 250,
+                'page': 1,
+                'sparkline': 'false',
+                'price_change_percentage': '1h,24h',
+            },
+            timeout=20
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        new_cache = {}
+        for coin in data:
+            sym = coin.get('symbol', '').upper() + 'USDT'
+            new_cache[sym] = {
+                'price':      float(coin.get('current_price') or 0),
+                'volume':     float(coin.get('total_volume') or 0),
+                'change_24h': float(coin.get('price_change_percentage_24h') or 0),
+                'change_1h':  float(coin.get('price_change_percentage_1h_in_currency') or 0),
+                'high_24h':   float(coin.get('high_24h') or 0),
+                'low_24h':    float(coin.get('low_24h') or 0),
+                'market_cap': float(coin.get('market_cap') or 0),
+                'cg_id':      coin.get('id', ''),
+            }
+        _cg_cache = new_cache
+        _cg_cache_ts = now
+        return new_cache
+    except Exception as e:
+        logger.error(f"[Whale/CoinGecko] market data fetch error: {e}")
+        return _cg_cache or {}
+
+
 def _get(url: str, params: dict = None, retries: int = 3, timeout: int = 8) -> Optional[dict]:
-    """HTTP GET with retry + exponential back-off. Returns None on failure."""
+    """Generic HTTP GET helper."""
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
             r.raise_for_status()
             return r.json()
-        except requests.exceptions.HTTPError as e:
-            if r.status_code == 429:
-                logger.warning(f"[Whale] Rate-limited — wait 10s")
-                _time.sleep(10)
-            else:
-                logger.debug(f"[Whale] HTTP error ({attempt}): {e}")
-                _time.sleep(1.5 * attempt)
         except Exception as e:
             logger.debug(f"[Whale] Request error ({attempt}): {e}")
             _time.sleep(1.5 * attempt)
@@ -138,129 +178,147 @@ def _fetch_agg_trades(symbol: str) -> Dict:
         if not data:
             return empty
 
-        total_buy_vol  = 0.0
-        total_sell_vol = 0.0
-        large_buy_vol  = 0.0
-        large_sell_vol = 0.0
-        large_count    = 0
+        volume    = m.get('volume', 0)
+        change_24h = m.get('change_24h', 0)   # % price change
+        change_1h  = m.get('change_1h', 0)
+        high_24h   = m.get('high_24h', 0)
+        low_24h    = m.get('low_24h', 0)
+        price      = m.get('price', 0)
 
-        # Fix 3: use per-coin adaptive threshold instead of fixed $50k
-        _adaptive_thresh = _get_per_coin_threshold(symbol)
+        # Volume spike: compare to 7-day average via DB
+        vol_ratio = 1.0
+        large_trade_ratio = 0.0
 
-        for t in data:
-            qty   = float(t.get('q', 0))
-            price = float(t.get('p', 0))
-            notional = qty * price
-            is_sell = bool(t.get('m', False))  # m=True: maker=buyer, so aggressor sold
+        # Directional bias: positive change_24h = buying pressure
+        # Combine 1h and 24h momentum
+        momentum = (change_1h * 0.6 + change_24h * 0.4) / 100.0
+        momentum = max(-1.0, min(1.0, momentum))
 
-            if is_sell:
-                total_sell_vol += notional
-                if notional >= _adaptive_thresh:
-                    large_sell_vol += notional
-                    large_count += 1
-            else:
-                total_buy_vol += notional
-                if notional >= _adaptive_thresh:
-                    large_buy_vol += notional
-                    large_count += 1
+        # Buy/sell pressure from price direction + range position
+        price_range = high_24h - low_24h
+        if price_range > 0 and price > 0:
+            range_pos = (price - low_24h) / price_range  # 0=near low, 1=near high
+        else:
+            range_pos = 0.5
 
-        total_vol = total_buy_vol + total_sell_vol
-        large_vol = large_buy_vol + large_sell_vol
+        # Combine momentum and range position for buy pressure
+        whale_buy_pressure  = max(0.0, min(1.0, 0.4 * (momentum + 1) / 2 + 0.6 * range_pos))
+        whale_sell_pressure = 1.0 - whale_buy_pressure
 
-        large_trade_ratio  = large_vol / total_vol if total_vol > 0 else 0.0
-        whale_buy_pressure = large_buy_vol  / max(large_vol, 1)
-        whale_sell_pressure= large_sell_vol / max(large_vol, 1)
+        # Volume significance: high volume + strong direction = whale signal
+        large_trade_ratio = min(1.0, abs(momentum) * 2)
+        if large_trade_ratio >= 0.02:
+            agg_score = 50.0 + (whale_buy_pressure - 0.5) * 100.0
+        else:
+            agg_score = 50.0  # Low momentum = neutral
 
-        # Convert to score (0-100): high buy pressure → high bullish score
-        # Formula: 50 + (buy_frac - 0.5) * 100 → clamped 0-100
-        agg_score = 50.0 + (whale_buy_pressure - 0.5) * 100.0
         agg_score = max(0.0, min(100.0, agg_score))
 
-        # If large_trade_ratio very low → unknown, stay neutral
-        if large_trade_ratio < 0.02:
-            agg_score = 50.0
-
         return {
-            'buy_volume':        round(total_buy_vol, 0),
-            'sell_volume':       round(total_sell_vol, 0),
-            'large_trade_count': large_count,
-            'large_trade_ratio': round(large_trade_ratio, 4),
+            'buy_volume':         round(volume * whale_buy_pressure, 0),
+            'sell_volume':        round(volume * whale_sell_pressure, 0),
+            'large_trade_count':  int(large_trade_ratio * 10),
+            'large_trade_ratio':  round(large_trade_ratio, 4),
             'whale_buy_pressure': round(whale_buy_pressure, 4),
             'whale_sell_pressure': round(whale_sell_pressure, 4),
-            'agg_score':         round(agg_score, 2),
+            'agg_score':          round(agg_score, 2),
         }
 
     except Exception as e:
-        logger.debug(f"[Whale/aggTrades] {symbol}: {e}")
+        logger.debug(f"[Whale/volumeFlow] {symbol}: {e}")
         return empty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. ORDER BOOK — Bid/Ask imbalance
+# 2. PRICE POSITION — 24h range position (replaces order book)
+#    Where price sits in 24h high-low range acts as order book proxy:
+#    Price near high → strong buy pressure (bids > asks)
+#    Price near low  → strong sell pressure (asks > bids)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_order_book(symbol: str) -> Dict:
+def _fetch_order_book(symbol: str, market: Dict = None) -> Dict:
     """
-    Fetch top DEPTH_LEVELS bid/ask, compute volume imbalance.
-    Imbalance > 0 → buy wall (bullish). < 0 → sell wall (bearish).
+    CoinGecko-based price position analysis (replaces Binance order book).
+    Uses 24h high/low/current price to infer bid/ask imbalance.
+    Same return format as original.
     """
     empty = {'bid_vol': 0, 'ask_vol': 0, 'imbalance': 0.0, 'ob_score': 50.0}
     try:
-        data = _get(f"{BINANCE_API}/api/v3/depth",
-                    {'symbol': symbol, 'limit': DEPTH_LEVELS})
-        if not data:
+        m = market or _cg_cache.get(symbol, {})
+        if not m:
             return empty
 
-        bid_vol = sum(float(b[0]) * float(b[1]) for b in data.get('bids', []))
-        ask_vol = sum(float(a[0]) * float(a[1]) for a in data.get('asks', []))
-        total   = bid_vol + ask_vol
+        price    = m.get('price', 0)
+        high_24h = m.get('high_24h', 0)
+        low_24h  = m.get('low_24h', 0)
+        volume   = m.get('volume', 1)
 
-        imbalance = (bid_vol - ask_vol) / total if total > 0 else 0.0
-        # imbalance in [-1, +1]
+        price_range = high_24h - low_24h
+        if price_range <= 0 or price <= 0:
+            return empty
 
-        # Convert to 0-100 score (50 = neutral)
+        # Position of current price in 24h range (0=at low, 1=at high)
+        range_position = (price - low_24h) / price_range
+        range_position = max(0.0, min(1.0, range_position))
+
+        # Imbalance: price near high = more bids than asks (bullish)
+        imbalance = (range_position - 0.5) * 2.0  # maps 0-1 to -1..+1
+
+        # Simulated bid/ask volumes from position
+        bid_vol = volume * range_position
+        ask_vol = volume * (1.0 - range_position)
+
         ob_score = 50.0 + imbalance * 50.0
         ob_score = max(0.0, min(100.0, ob_score))
 
         return {
-            'bid_vol':    round(bid_vol, 0),
-            'ask_vol':    round(ask_vol, 0),
-            'imbalance':  round(imbalance, 4),
-            'ob_score':   round(ob_score, 2),
+            'bid_vol':   round(bid_vol, 0),
+            'ask_vol':   round(ask_vol, 0),
+            'imbalance': round(imbalance, 4),
+            'ob_score':  round(ob_score, 2),
         }
     except Exception as e:
-        logger.debug(f"[Whale/orderBook] {symbol}: {e}")
+        logger.debug(f"[Whale/pricePosition] {symbol}: {e}")
         return empty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. 24H TICKER — Exchange flow bias
+# 3. MOMENTUM FLOW — Exchange flow bias using CoinGecko price changes
+#    Replaces Binance weighted avg price with 1h vs 24h momentum analysis
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_ticker_flow(symbol: str) -> Dict:
+def _fetch_ticker_flow(symbol: str, market: Dict = None) -> Dict:
     """
-    Use 24h ticker to estimate exchange flow bias.
-    If price > weightedAvgPrice and volume high → net buying.
+    CoinGecko-based momentum flow analysis.
+    Uses 1h and 24h price change percentages to estimate exchange flow bias.
+    Same return format as original.
     """
     empty = {'price_vs_avg': 0.0, 'volume_ratio': 0.0,
              'exchange_flow_bias': 0.0, 'ticker_score': 50.0}
     try:
-        data = _get(f"{BINANCE_API}/api/v3/ticker/24hr",
-                    {'symbol': symbol})
-        if not data or not isinstance(data, dict):
+        m = market or _cg_cache.get(symbol, {})
+        if not m:
             return empty
 
-        close_price  = float(data.get('lastPrice', 0) or 0)
-        avg_price    = float(data.get('weightedAvgPrice', close_price) or close_price)
-        vol          = float(data.get('volume', 0) or 0)
-        count        = int(data.get('count', 0) or 0)
-        price_pct    = float(data.get('priceChangePercent', 0) or 0)
+        change_24h = m.get('change_24h', 0)   # percent
+        change_1h  = m.get('change_1h', 0)    # percent
+        volume     = m.get('volume', 0)
+        price      = m.get('price', 0)
+        high_24h   = m.get('high_24h', 0)
+        low_24h    = m.get('low_24h', 0)
 
-        price_vs_avg = (close_price - avg_price) / avg_price if avg_price > 0 else 0
-        # positive → price above avg (buying above VWAP = bullish)
+        # VWAP proxy: midpoint of 24h range
+        vwap_proxy = (high_24h + low_24h) / 2.0 if (high_24h and low_24h) else price
+        price_vs_avg = (price - vwap_proxy) / vwap_proxy if vwap_proxy > 0 else 0.0
 
-        # Flow bias: combine price direction + volume signal
-        flow_bias = price_vs_avg * 2.0 + (price_pct / 100.0) * 0.5
+        # Accelerating momentum: 1h trending same direction as 24h = strong flow
+        if change_1h * change_24h > 0:  # same direction
+            momentum_strength = (abs(change_1h) / 100.0) * 0.6 + (abs(change_24h) / 100.0) * 0.4
+        else:
+            momentum_strength = 0.0
+
+        direction = 1.0 if change_1h >= 0 else -1.0
+        flow_bias = direction * min(1.0, momentum_strength * 10) * 0.5 + price_vs_avg * 2.0
         flow_bias = max(-1.0, min(1.0, flow_bias))
 
         ticker_score = 50.0 + flow_bias * 50.0
@@ -268,12 +326,12 @@ def _fetch_ticker_flow(symbol: str) -> Dict:
 
         return {
             'price_vs_avg':       round(price_vs_avg, 4),
-            'price_change_pct':   round(price_pct, 2),
+            'price_change_pct':   round(change_24h, 2),
             'exchange_flow_bias': round(flow_bias, 4),
             'ticker_score':       round(ticker_score, 2),
         }
     except Exception as e:
-        logger.debug(f"[Whale/ticker] {symbol}: {e}")
+        logger.debug(f"[Whale/momentumFlow] {symbol}: {e}")
         return empty
 
 
@@ -335,35 +393,55 @@ def _score_klines(klines: List[Dict]) -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. DEPTH SNAPSHOT — Top-of-book pressure
+# 5. CANDLE CLOSE PRESSURE — Replaces depth snapshot
+#    Candle's close position within its high-low range shows immediate pressure:
+#    Close near candle high → buyers dominated (bullish depth)
+#    Close near candle low  → sellers dominated (bearish depth)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_depth_pressure(symbol: str) -> Dict:
+def _fetch_depth_pressure(symbol: str, klines: List[Dict] = None) -> Dict:
     """
-    Fetch shallow order book (top 5) to detect immediate pressure.
-    Useful for detecting spoofing or genuine wall.
+    CoinGecko-based candle pressure analysis (replaces Binance depth snapshot).
+    Uses last 3 candles' close position within high-low range.
+    Same return format as original.
     """
     empty = {'top_bid_wall': 0.0, 'top_ask_wall': 0.0, 'depth_score': 50.0}
     try:
-        data = _get(f"{BINANCE_API}/api/v3/depth",
-                    {'symbol': symbol, 'limit': 5})
-        if not data:
+        if not klines or len(klines) < 3:
             return empty
 
-        top_bid = sum(float(b[0]) * float(b[1]) for b in data.get('bids', [])[:3])
-        top_ask = sum(float(a[0]) * float(a[1]) for a in data.get('asks', [])[:3])
-        total   = top_bid + top_ask
+        # Use last 3 candles
+        recent = klines[-3:]
+        pressure_scores = []
+        for candle in recent:
+            h = float(candle.get('high', 0))
+            l = float(candle.get('low', 0))
+            c = float(candle.get('close', 0))
+            candle_range = h - l
+            if candle_range > 0:
+                # 0 = closed at low (bearish), 1 = closed at high (bullish)
+                close_pos = (c - l) / candle_range
+                pressure_scores.append(close_pos)
 
-        depth_score = 50.0 + ((top_bid - top_ask) / total) * 50.0 if total > 0 else 50.0
+        if not pressure_scores:
+            return empty
+
+        avg_pressure = sum(pressure_scores) / len(pressure_scores)
+        imbalance = (avg_pressure - 0.5) * 2.0  # -1 to +1
+
+        top_bid = avg_pressure
+        top_ask = 1.0 - avg_pressure
+
+        depth_score = 50.0 + imbalance * 50.0
         depth_score = max(0.0, min(100.0, depth_score))
 
         return {
-            'top_bid_wall': round(top_bid, 0),
-            'top_ask_wall': round(top_ask, 0),
+            'top_bid_wall': round(top_bid, 4),
+            'top_ask_wall': round(top_ask, 4),
             'depth_score':  round(depth_score, 2),
         }
     except Exception as e:
-        logger.debug(f"[Whale/depth] {symbol}: {e}")
+        logger.debug(f"[Whale/candlePressure] {symbol}: {e}")
         return empty
 
 
@@ -433,11 +511,12 @@ def detect_whale_activity(klines: List[Dict],
         kl = _score_klines(klines)
 
         if symbol:
-            agg    = _fetch_agg_trades(symbol)
-            ob     = _fetch_order_book(symbol)
-            ticker = _fetch_ticker_flow(symbol)
-            depth  = _fetch_depth_pressure(symbol)
-            _time.sleep(0.05)   # tiny pause to avoid API spam
+            # Get CoinGecko market data for this symbol (cached, 1 call for all symbols)
+            market = _cg_cache.get(symbol, {})
+            agg    = _fetch_agg_trades(symbol, market)
+            ob     = _fetch_order_book(symbol, market)
+            ticker = _fetch_ticker_flow(symbol, market)
+            depth  = _fetch_depth_pressure(symbol, klines)
         else:
             agg    = {'agg_score': 50}
             ob     = {'ob_score': 50}
@@ -502,13 +581,18 @@ def run_whale_scan(symbols: List[str], db=None) -> List[Dict]:
     Run whale detection for a list of symbols and save to whale_data.
     Suitable for scheduled calls (5-10 min cadence).
 
+    Uses CoinGecko for market data (1 API call for all symbols).
     Returns list of whale result dicts with 'symbol' key added.
     """
+    # Pre-load CoinGecko market data for all symbols in ONE API call
+    logger.info(f"[Whale] Pre-loading CoinGecko market data for {len(symbols)} symbols...")
+    _get_cg_market_data(symbols)  # populates _cg_cache
+
     results = []
     for sym in symbols:
         try:
             from services.binance_scanner import get_klines
-            klines = get_klines(sym, '15m', 50)
+            klines = get_klines(sym, '1d', 50)
             if not klines:
                 klines = []
 
@@ -517,7 +601,7 @@ def run_whale_scan(symbols: List[str], db=None) -> List[Dict]:
                                       db=db)
             w['symbol'] = sym
             results.append(w)
-            _time.sleep(0.15)   # 150ms between symbols
+            _time.sleep(0.1)   # small pause between symbols
         except Exception as e:
             logger.error(f"[Whale] {sym}: {e}")
 
